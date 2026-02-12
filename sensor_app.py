@@ -23,6 +23,7 @@ class SensorData:
     
     def __init__(self):
         self.data = None
+        self.original_data = None
         self.filename = None
         self.depth_column = 'depth'
         self.value_column = 'value'
@@ -30,21 +31,19 @@ class SensorData:
     def load_from_file(self, filepath):
         """Load sensor data from CSV file."""
         try:
-            self.data = pd.read_csv(filepath)
+            self.original_data = pd.read_csv(filepath)
+            self.data = self.original_data.copy()
             self.filename = Path(filepath).name
             return True
         except Exception as e:
             raise Exception(f"Error loading file: {str(e)}")
     
-    def apply_offset(self, offset):
-        """Apply depth offset adjustment."""
-        if self.data is not None and self.depth_column in self.data.columns:
-            self.data[self.depth_column] = self.data[self.depth_column] + offset
-    
-    def apply_scaling(self, scale_factor):
-        """Apply scaling factor to depth values."""
-        if self.data is not None and self.depth_column in self.data.columns:
-            self.data[self.depth_column] = self.data[self.depth_column] * scale_factor
+    def apply_adjustments(self, offset=0.0, scale=1.0):
+        """Apply depth offset and scaling adjustments to data."""
+        if self.original_data is not None and self.depth_column in self.original_data.columns:
+            # Start with original data and apply adjustments
+            self.data = self.original_data.copy()
+            self.data[self.depth_column] = (self.data[self.depth_column] * scale) + offset
     
     def save_to_file(self, filepath):
         """Save adjusted data to CSV file."""
@@ -297,7 +296,7 @@ class DepthSensorApp(QMainWindow):
         """Apply current adjustment values to sensor data."""
         sensor = self.sensor1 if sensor_num == 1 else self.sensor2
         
-        if sensor.data is None:
+        if sensor.original_data is None:
             return
         
         # Get adjustment values
@@ -308,8 +307,10 @@ class DepthSensorApp(QMainWindow):
             offset = self.offset_spin2.value()
             scale = self.scale_spin2.value()
         
-        # Reload original data and apply adjustments
-        # (This is a simplified approach - in production, you'd keep original data separate)
+        # Apply adjustments to sensor data
+        sensor.apply_adjustments(offset=offset, scale=scale)
+        
+        # Update the plot
         self.update_plot()
     
     def save_sensor_data(self, sensor_num):
