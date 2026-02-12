@@ -40,3 +40,8 @@ Thumbs.db
 *.csv
 *.dat
 test_data/
+
+# Generated visualizations
+*.png
+*.jpg
+*.jpeg
