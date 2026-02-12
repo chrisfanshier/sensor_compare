@@ -68,6 +68,16 @@ This will create two sample CSV files with simulated depth sensor data.
 
 ## Adjustments
 
+### Adjustment Order
+The application applies adjustments using the formula:
+```
+adjusted_depth = (original_depth × scale_factor) + offset
+```
+
+This order (scale first, then offset) is chosen because:
+1. **Scale Factor** corrects systematic errors in the measurement (calibration)
+2. **Offset** adjusts for mounting position or reference point differences
+
 ### Depth Offset
 Adds a constant value to all depth measurements. Use this to:
 - Correct for instrument mounting position
@@ -79,6 +89,11 @@ Multiplies all depth measurements by a constant factor. Use this to:
 - Apply calibration corrections
 - Convert between measurement units
 - Correct for systematic scaling errors
+
+**Example:** If a sensor reads 100m but should read 110m:
+- Option 1: Apply scale factor of 1.1 (systematic 10% error)
+- Option 2: Apply offset of +10m (constant 10m error)
+- Option 3: Apply scale 1.05 and offset +5m (combined correction)
 
 ## Requirements
 

@@ -45,7 +45,16 @@ try:
                 raise Exception(f"Error loading file: {str(e)}")
         
         def apply_adjustments(self, offset=0.0, scale=1.0):
-            """Apply depth offset and scaling adjustments to data."""
+            """
+            Apply depth offset and scaling adjustments to data.
+            
+            The adjustment formula is: adjusted_depth = (original_depth * scale) + offset
+            This applies scaling first (for calibration), then offset (for position adjustment).
+            
+            Args:
+                offset: Depth offset in meters (applied after scaling)
+                scale: Scale factor (applied first, typically for calibration)
+            """
             if self.original_data is not None and self.depth_column in self.original_data.columns:
                 # Start with original data and apply adjustments
                 self.data = self.original_data.copy()
