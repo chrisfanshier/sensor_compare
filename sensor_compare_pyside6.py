@@ -491,22 +491,37 @@ class CTDAnalyzerApp(QMainWindow):
             self.log("\n" + "="*50)
             self.log("Processing...")
             
-            # Load data - try different strategies
+            # Load data - try different strategies and encodings
             skip_rows = self.skip_rows_spin.value()
             
             # First, try reading with comment='#'
-            try:
-                df = pd.read_csv(self.filepath, comment='#')
-                self.log(f"Loaded {len(df)} rows (using comment='#')")
-            except Exception as e1:
-                # If that fails, try skipping rows
+            df = None
+            for encoding in ['utf-8', 'utf-8-sig', 'cp1252', 'iso-8859-1', 'latin-1']:
                 try:
-                    df = pd.read_csv(self.filepath, skiprows=skip_rows)
-                    self.log(f"Loaded {len(df)} rows (skipping {skip_rows} rows)")
-                except Exception as e2:
-                    # Last resort: try reading and auto-detect
-                    df = pd.read_csv(self.filepath)
-                    self.log(f"Loaded {len(df)} rows (default read)")
+                    df = pd.read_csv(self.filepath, comment='#', encoding=encoding)
+                    self.log(f"Loaded {len(df)} rows (using comment='#', encoding={encoding})")
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+                except Exception as e1:
+                    # If that fails, try skipping rows
+                    try:
+                        df = pd.read_csv(self.filepath, skiprows=skip_rows, encoding=encoding)
+                        self.log(f"Loaded {len(df)} rows (skipping {skip_rows} rows, encoding={encoding})")
+                        break
+                    except (UnicodeDecodeError, UnicodeError):
+                        continue
+                    except Exception as e2:
+                        # Last resort: try reading with auto-detect
+                        try:
+                            df = pd.read_csv(self.filepath, encoding=encoding)
+                            self.log(f"Loaded {len(df)} rows (default read, encoding={encoding})")
+                            break
+                        except (UnicodeDecodeError, UnicodeError):
+                            continue
+            
+            if df is None:
+                raise ValueError("Could not load CSV file with any common encoding")
             
             self.log(f"Columns found: {len(df.columns)} columns")
             
@@ -1494,9 +1509,18 @@ class CTDAnalyzerApp(QMainWindow):
             return
         
         try:
-            # Read file with comment handling
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
+            # Read file with comment handling - try multiple encodings
+            lines = None
+            for encoding in ['utf-8', 'utf-8-sig', 'cp1252', 'iso-8859-1', 'latin-1']:
+                try:
+                    with open(file_path, 'r', encoding=encoding) as f:
+                        lines = f.readlines()
+                    break  # Success, stop trying encodings
+                except (UnicodeDecodeError, UnicodeError):
+                    continue  # Try next encoding
+            
+            if lines is None:
+                raise ValueError("Could not decode file with any common encoding")
             
             # Look for core title and column header line
             core_title = None
@@ -1508,7 +1532,18 @@ class CTDAnalyzerApp(QMainWindow):
                     skiprows = i
                     break
             
-            df = pd.read_csv(file_path, skiprows=skiprows)
+            # Read the CSV with the same encoding detection approach
+            df = None
+            for encoding in ['utf-8', 'utf-8-sig', 'cp1252', 'iso-8859-1', 'latin-1']:
+                try:
+                    df = pd.read_csv(file_path, skiprows=skiprows, encoding=encoding)
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+            
+            if df is None:
+                raise ValueError("Could not decode CSV with any common encoding")
+                
             df.columns = df.columns.str.strip()
             
             if 'datetime' not in df.columns:
