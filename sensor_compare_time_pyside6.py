@@ -2462,8 +2462,13 @@ class CTDAnalyzerApp(QMainWindow):
             
             # Add selection region if exists
             if self.time_selection_start_idx is not None and self.time_selection_end_idx is not None:
-                start_x = x.iloc[self.time_selection_start_idx]
-                end_x = x.iloc[self.time_selection_end_idx]
+                # Use index values directly instead of time values
+                start_time = self.timelag_df[datetime_col].iloc[self.time_selection_start_idx]
+                end_time = self.timelag_df[datetime_col].iloc[self.time_selection_end_idx]
+                
+                # Convert to x-axis coordinates (seconds since epoch)
+                start_x = start_time.value / 1e9  # pandas Timestamp to seconds
+                end_x = end_time.value / 1e9
                 
                 selection_region = pg.LinearRegionItem(
                     values=[start_x, end_x],
@@ -2471,9 +2476,16 @@ class CTDAnalyzerApp(QMainWindow):
                     movable=False
                 )
                 self.timelag_depth_plot.addItem(selection_region)
-            
-            self.timelag_depth_plot.autoRange()
-            self.timelag_log_msg(f"Plotted {plots_added} sensors successfully")
+                
+                # Make sure region is visible in current view
+                self.timelag_depth_plot.setXRange(
+                    start_x - (end_x - start_x) * 0.2,  # 20% padding
+                    end_x + (end_x - start_x) * 0.2,
+                    padding=0
+                )
+                
+                self.timelag_depth_plot.autoRange()
+                self.timelag_log_msg(f"Plotted {plots_added} sensors successfully")
             
         except Exception as e:
             self.timelag_log_msg(f"ERROR plotting: {str(e)}")

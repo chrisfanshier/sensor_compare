@@ -1,0 +1,402 @@
+"""
+SensorPlotView - The main persistent depth-vs-time plot.
+
+Used by all modes. Supports:
+- Plotting depth sensor traces
+- Plotting pairwise depth differences
+- Selection regions (double-click to start/end)
+- Crosshair tracking with info label
+- Y-axis inversion for depth
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pyqtgraph as pg
+
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
+from PySide6.QtCore import Qt, Signal
+
+from ...domain.models.sensor_data import SensorData
+
+# Sensor colors
+SENSOR_COLORS = ['#6baed6', '#74c476', '#fd8d3c', '#9e9ac8', '#e6550d', '#e7ba52']
+SENSOR_COLORS_QT = ['b', 'g', 'r', 'm', 'c', 'y']
+
+
+class SensorPlotView(QWidget):
+    """
+    Persistent main plot widget displaying depth vs time.
+    
+    Signals:
+        selection_changed(int, int): Emitted when a selection is completed (start_idx, end_idx).
+        selection_cleared: Emitted when selection is cleared.
+    """
+
+    selection_changed = Signal(int, int)
+    selection_cleared = Signal()
+
+    def __init__(self, parent=None, use_datetime_axis: bool = True):
+        super().__init__(parent)
+
+        self._sensor_data: SensorData | None = None
+        self._selection_mode = False
+        self._selecting = False
+        self._drag_start_x: float | None = None
+        self._selection_start_idx: int | None = None
+        self._selection_end_idx: int | None = None
+        self._selection_region: pg.LinearRegionItem | None = None
+        self._use_datetime_axis = use_datetime_axis
+        self._y_inverted = False
+
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # Info label (crosshair readout)
+        self.info_label = QLabel('')
+        self.info_label.setStyleSheet(
+            'QLabel { background-color: white; padding: 5px; border: 1px solid gray; }'
+        )
+        layout.addWidget(self.info_label)
+
+        # Plot widget
+        pg.setConfigOptions(antialias=True, useOpenGL=True)
+        if self._use_datetime_axis:
+            date_axis = pg.graphicsItems.DateAxisItem.DateAxisItem(orientation='bottom')
+            self.plot_widget = pg.PlotWidget(
+                axisItems={'bottom': date_axis}, useOpenGL=True
+            )
+        else:
+            self.plot_widget = pg.PlotWidget(useOpenGL=True)
+
+        self.plot_widget.setBackground('w')
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.plot_widget.addLegend()
+        self.plot_widget.setLabel('left', 'Depth (m)')
+
+        # Performance
+        self.plot_widget.setDownsampling(auto=True, mode='peak')
+        self.plot_widget.setClipToView(True)
+
+        # Crosshairs
+        self._vline = pg.InfiniteLine(
+            angle=90, movable=False,
+            pen=pg.mkPen('r', width=1, style=Qt.DashLine)
+        )
+        self._hline = pg.InfiniteLine(
+            angle=0, movable=False,
+            pen=pg.mkPen('r', width=1, style=Qt.DashLine)
+        )
+        self.plot_widget.addItem(self._vline, ignoreBounds=True)
+        self.plot_widget.addItem(self._hline, ignoreBounds=True)
+        self._vline.setVisible(False)
+        self._hline.setVisible(False)
+
+        layout.addWidget(self.plot_widget)
+
+        # Mouse events
+        self._mouse_proxy = pg.SignalProxy(
+            self.plot_widget.scene().sigMouseMoved,
+            rateLimit=60,
+            slot=self._on_mouse_moved,
+        )
+        self.plot_widget.scene().sigMouseClicked.connect(self._on_mouse_clicked)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def set_sensor_data(self, sensor_data: SensorData | None):
+        """Set the current sensor data (does not auto-plot)."""
+        self._sensor_data = sensor_data
+
+    def plot_depths(self, sensor_data: SensorData | None = None, title: str = ''):
+        """Plot depth traces for all sensors."""
+        if sensor_data is not None:
+            self._sensor_data = sensor_data
+        if self._sensor_data is None:
+            return
+
+        self._clear_plot()
+
+        if title:
+            self.plot_widget.setTitle(title)
+        self.plot_widget.setLabel('left', 'Depth (m)')
+
+        x = self._sensor_data.get_timestamps_epoch()
+
+        for i, label in enumerate(self._sensor_data.sensor_labels):
+            col = f'Sensor_{label}_Depth'
+            if col not in self._sensor_data.df.columns:
+                continue
+            data = self._sensor_data.df[col].values
+            if np.sum(~np.isnan(data)) == 0:
+                continue
+            pen = pg.mkPen(color=SENSOR_COLORS[i % len(SENSOR_COLORS)], width=2)
+            self.plot_widget.plot(
+                x, data, pen=pen, name=f'Sensor {label}',
+                connect='finite', skipFiniteCheck=True,
+            )
+
+        self._ensure_y_inverted(True)
+        self.plot_widget.autoRange()
+        self._draw_selection()
+
+    def plot_depths_with_labels(
+        self,
+        sensor_data: SensorData,
+        label_suffix: dict[str, str] | None = None,
+        title: str = '',
+    ):
+        """Plot depths with custom label suffixes (e.g., showing offsets)."""
+        self._sensor_data = sensor_data
+        self._clear_plot()
+
+        if title:
+            self.plot_widget.setTitle(title)
+        self.plot_widget.setLabel('left', 'Depth (m)')
+
+        x = sensor_data.get_timestamps_epoch()
+
+        for i, label in enumerate(sensor_data.sensor_labels):
+            col = f'Sensor_{label}_Depth'
+            if col not in sensor_data.df.columns:
+                continue
+            data = sensor_data.df[col].values
+            suffix = (label_suffix or {}).get(label, '')
+            name = f'Sensor {label}{suffix}'
+            pen = pg.mkPen(color=SENSOR_COLORS[i % len(SENSOR_COLORS)], width=2)
+            self.plot_widget.plot(
+                x, data, pen=pen, name=name,
+                connect='finite', skipFiniteCheck=True,
+            )
+
+        self._ensure_y_inverted(True)
+        self.plot_widget.autoRange()
+        self._draw_selection()
+
+    def plot_differences(self, sensor_data: SensorData | None = None):
+        """Plot pairwise depth differences."""
+        if sensor_data is not None:
+            self._sensor_data = sensor_data
+        if self._sensor_data is None:
+            return
+
+        self._clear_plot()
+        self.plot_widget.setLabel('left', 'Depth Difference (m)')
+        self.plot_widget.setTitle('Sensor Differences')
+
+        diffs = self._sensor_data.compute_pairwise_differences()
+        x = np.arange(len(self._sensor_data.df))
+
+        for idx, ((label_j, label_i), series) in enumerate(diffs.items()):
+            pen = pg.mkPen(
+                color=SENSOR_COLORS_QT[idx % len(SENSOR_COLORS_QT)], width=2
+            )
+            self.plot_widget.plot(
+                x, series.values, pen=pen,
+                name=f'{label_j} - {label_i}',
+                connect='finite', skipFiniteCheck=True,
+            )
+
+        # Zero line
+        pen_zero = pg.mkPen('k', width=1, style=Qt.DashLine)
+        self.plot_widget.plot([0, len(self._sensor_data.df) - 1], [0, 0], pen=pen_zero)
+
+        self._ensure_y_inverted(False)
+        self.plot_widget.autoRange()
+        self._draw_selection()
+
+    def clear(self):
+        """Clear the plot."""
+        self._clear_plot()
+
+    # ------------------------------------------------------------------
+    # Selection mode
+    # ------------------------------------------------------------------
+
+    @property
+    def selection_mode(self) -> bool:
+        return self._selection_mode
+
+    @selection_mode.setter
+    def selection_mode(self, enabled: bool):
+        self._selection_mode = enabled
+        self.plot_widget.plotItem.vb.setMouseEnabled(x=not enabled, y=not enabled)
+        if not enabled:
+            self._selecting = False
+
+    @property
+    def selection(self) -> tuple[int, int] | None:
+        if self._selection_start_idx is not None and self._selection_end_idx is not None:
+            return (self._selection_start_idx, self._selection_end_idx)
+        return None
+
+    def clear_selection(self):
+        self._selection_start_idx = None
+        self._selection_end_idx = None
+        self._selecting = False
+        if self._selection_region is not None:
+            self.plot_widget.setUpdatesEnabled(False)
+            try:
+                self.plot_widget.removeItem(self._selection_region)
+            except Exception:
+                pass
+            finally:
+                self._selection_region = None
+                self.plot_widget.setUpdatesEnabled(True)
+        self.selection_cleared.emit()
+
+    # ------------------------------------------------------------------
+    # Private
+    # ------------------------------------------------------------------
+
+    def _clear_plot(self):
+        # Temporarily block signals/painting during rebuild
+        self.plot_widget.setUpdatesEnabled(False)
+        try:
+            # Remove selection region before clear to avoid stale paint
+            if self._selection_region is not None:
+                try:
+                    self.plot_widget.removeItem(self._selection_region)
+                except Exception:
+                    pass
+                self._selection_region = None
+
+            self.plot_widget.clear()
+            self.plot_widget.addLegend()
+            # Re-create crosshair lines (fresh items avoid stale scene refs)
+            self._vline = pg.InfiniteLine(
+                angle=90, movable=False,
+                pen=pg.mkPen('r', width=1, style=Qt.DashLine),
+            )
+            self._hline = pg.InfiniteLine(
+                angle=0, movable=False,
+                pen=pg.mkPen('r', width=1, style=Qt.DashLine),
+            )
+            self.plot_widget.addItem(self._vline, ignoreBounds=True)
+            self.plot_widget.addItem(self._hline, ignoreBounds=True)
+            self._vline.setVisible(False)
+            self._hline.setVisible(False)
+        finally:
+            self.plot_widget.setUpdatesEnabled(True)
+
+    def _ensure_y_inverted(self, should_invert: bool):
+        if should_invert != self._y_inverted:
+            self.plot_widget.invertY(should_invert)
+            self._y_inverted = should_invert
+
+    def _draw_selection(self):
+        """Draw selection region if one exists."""
+        # Remove old region
+        if self._selection_region is not None:
+            try:
+                self.plot_widget.removeItem(self._selection_region)
+            except Exception:
+                pass
+            self._selection_region = None
+
+        if self._selection_start_idx is None or self._selection_end_idx is None:
+            return
+        if self._sensor_data is None:
+            return
+
+        # Bounds check against current data
+        max_idx = len(self._sensor_data.df) - 1
+        start_idx = min(self._selection_start_idx, max_idx)
+        end_idx = min(self._selection_end_idx, max_idx)
+        if start_idx < 0 or end_idx < 0 or start_idx >= end_idx:
+            return
+
+        # Build x-coordinates for region
+        if self._use_datetime_axis:
+            timestamps = self._sensor_data.get_timestamps_epoch()
+            start_x = float(timestamps[start_idx])
+            end_x = float(timestamps[end_idx])
+        else:
+            start_x = float(start_idx)
+            end_x = float(end_idx)
+
+        self.plot_widget.setUpdatesEnabled(False)
+        try:
+            self._selection_region = pg.LinearRegionItem(
+                values=[start_x, end_x],
+                brush=pg.mkBrush(255, 0, 0, 50),
+                movable=False,
+            )
+            self.plot_widget.addItem(self._selection_region)
+        finally:
+            self.plot_widget.setUpdatesEnabled(True)
+
+    def _on_mouse_moved(self, evt):
+        if self._sensor_data is None:
+            return
+
+        pos = evt[0]
+        if not self.plot_widget.sceneBoundingRect().contains(pos):
+            return
+
+        mouse_point = self.plot_widget.plotItem.vb.mapSceneToView(pos)
+        x_pos = mouse_point.x()
+        y_pos = mouse_point.y()
+
+        self._vline.setPos(x_pos)
+        self._hline.setPos(y_pos)
+        self._vline.setVisible(True)
+        self._hline.setVisible(True)
+
+        # Find nearest data point
+        if self._use_datetime_axis:
+            timestamps = self._sensor_data.get_timestamps_epoch()
+            idx = int(np.argmin(np.abs(timestamps - x_pos)))
+        else:
+            idx = max(0, min(int(round(x_pos)), len(self._sensor_data.df) - 1))
+
+        if 0 <= idx < len(self._sensor_data.df):
+            actual_time = self._sensor_data.df[self._sensor_data.datetime_col].iloc[idx]
+            time_str = actual_time.strftime('%Y-%m-%d %H:%M:%S') if pd.notna(actual_time) else 'N/A'
+            info_text = f"Index: {idx}  |  Time: {time_str}  |  "
+
+            for label in self._sensor_data.sensor_labels:
+                col = f'Sensor_{label}_Depth'
+                if col in self._sensor_data.df.columns:
+                    val = self._sensor_data.df[col].iloc[idx]
+                    if pd.notna(val):
+                        info_text += f"Sensor {label}: {val:.3f}m  "
+
+            self.info_label.setText(info_text)
+
+    def _on_mouse_clicked(self, event):
+        if self._sensor_data is None or not self._selection_mode:
+            return
+
+        if event.double():
+            pos = event.scenePos()
+            mouse_point = self.plot_widget.plotItem.vb.mapSceneToView(pos)
+            x = mouse_point.x()
+
+            if not self._selecting:
+                self._selecting = True
+                self._drag_start_x = x
+            else:
+                self._selecting = False
+                start_x = min(self._drag_start_x, x)
+                end_x = max(self._drag_start_x, x)
+
+                if self._use_datetime_axis:
+                    timestamps = self._sensor_data.get_timestamps_epoch()
+                    self._selection_start_idx = int(np.argmin(np.abs(timestamps - start_x)))
+                    self._selection_end_idx = int(np.argmin(np.abs(timestamps - end_x)))
+                else:
+                    self._selection_start_idx = max(0, int(start_x))
+                    self._selection_end_idx = min(
+                        len(self._sensor_data.df) - 1, int(end_x)
+                    )
+
+                self._draw_selection()
+                self.selection_changed.emit(
+                    self._selection_start_idx, self._selection_end_idx
+                )

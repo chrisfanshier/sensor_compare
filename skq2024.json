@@ -1,0 +1,17 @@
+{
+  "num_sensors": 2,
+  "sensor_labels": [
+    "A",
+    "B"
+  ],
+  "regressions": [
+    {
+      "sensor_i": "A",
+      "sensor_j": "B",
+      "slope": 0.00012115352872185339,
+      "intercept": -0.7230772392409707,
+      "r_squared": 0.03347966949120612,
+      "p_value": 0.5902237050110675
+    }
+  ]
+}
