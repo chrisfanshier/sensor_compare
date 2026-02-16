@@ -27,15 +27,17 @@ from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QAction
 
 from ..gui.views.sensor_plot_view import SensorPlotView
-from ..gui.views.velocity_plot_view import VelocityPlotView
+from ..gui.views.velocity_plot_view import HeavePlotView
 from ..gui.views.statistics_table import StatisticsTableView
+from ..gui.views.trip_plot_view import TripPlotView
 from ..gui.panels.view_data_panel import ViewDataPanel
 from ..gui.panels.depth_offset_panel import DepthOffsetPanel
 from ..gui.panels.time_offset_panel import TimeOffsetPanel
 from ..gui.panels.create_calibration_panel import CreateCalibrationPanel
+from ..gui.panels.trip_detector_panel import TripDetectorPanel
 from ..controllers.analysis_controller import AnalysisController
 
-MODES = ['View Data', 'Depth Offset', 'Time Offset', 'Create Calibration']
+MODES = ['View Data', 'Depth Offset', 'Time Offset', 'Create Calibration', 'Trip Detector']
 
 
 class MainWindow(QMainWindow):
@@ -98,11 +100,13 @@ class MainWindow(QMainWindow):
         self.depth_panel = DepthOffsetPanel()
         self.time_panel = TimeOffsetPanel()
         self.calibration_panel = CreateCalibrationPanel()
+        self.trip_panel = TripDetectorPanel()
 
         self.panel_stack.addWidget(self.view_panel)      # 0
         self.panel_stack.addWidget(self.depth_panel)      # 1
         self.panel_stack.addWidget(self.time_panel)       # 2
         self.panel_stack.addWidget(self.calibration_panel) # 3
+        self.panel_stack.addWidget(self.trip_panel)       # 4
 
         self.panel_stack.setMinimumWidth(400)
         self.panel_stack.setMaximumWidth(550)
@@ -111,12 +115,14 @@ class MainWindow(QMainWindow):
         self.main_plot = SensorPlotView()
 
         # -- Secondary views (bottom-right) --
-        self.velocity_plot = VelocityPlotView()
+        self.heave_plot = HeavePlotView()
         self.statistics_table = StatisticsTableView()
+        self.trip_plot = TripPlotView()
 
         self.secondary_stack = QStackedWidget()
-        self.secondary_stack.addWidget(self.velocity_plot)    # 0
+        self.secondary_stack.addWidget(self.heave_plot)       # 0
         self.secondary_stack.addWidget(self.statistics_table) # 1
+        self.secondary_stack.addWidget(self.trip_plot)        # 2
         self.secondary_stack.setVisible(False)
 
         # -- Right splitter (main plot + secondary) --
@@ -137,12 +143,14 @@ class MainWindow(QMainWindow):
 
         # -- Assign to controller --
         self.controller.main_plot = self.main_plot
-        self.controller.velocity_plot = self.velocity_plot
+        self.controller.heave_plot = self.heave_plot
         self.controller.statistics_table = self.statistics_table
+        self.controller.trip_plot = self.trip_plot
         self.controller.view_panel = self.view_panel
         self.controller.depth_panel = self.depth_panel
         self.controller.time_panel = self.time_panel
         self.controller.calibration_panel = self.calibration_panel
+        self.controller.trip_panel = self.trip_panel
 
     def _build_status_bar(self):
         self.statusBar().showMessage("Ready")
@@ -161,11 +169,13 @@ class MainWindow(QMainWindow):
         return self.mode_combo.currentText()
 
     def show_secondary_view(self, view_type: str):
-        """Show the secondary view area (velocity or statistics)."""
-        if view_type == 'velocity':
+        """Show the secondary view area (velocity, statistics, or trip)."""
+        if view_type == 'heave':
             self.secondary_stack.setCurrentIndex(0)
         elif view_type == 'statistics':
             self.secondary_stack.setCurrentIndex(1)
+        elif view_type == 'trip':
+            self.secondary_stack.setCurrentIndex(2)
         self.secondary_stack.setVisible(True)
 
     def hide_secondary_view(self):

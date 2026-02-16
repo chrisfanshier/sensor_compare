@@ -1,13 +1,13 @@
 """
 TimeOffsetPanel - Control panel for the "Time Offset" mode.
 
-Savgol filter parameters, reference sensor selection, time offset calculation.
+Bandpass filter parameters, reference sensor selection, heave cross-correlation.
 """
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
     QGroupBox, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QGridLayout,
-    QComboBox, QSpinBox, QTextEdit, QFileDialog, QMessageBox,
+    QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QFileDialog, QMessageBox,
 )
 from PySide6.QtCore import Signal
 
@@ -58,25 +58,37 @@ class TimeOffsetPanel(BaseModePanel):
         data_group.setLayout(data_layout)
         self._layout.addWidget(data_group)
 
-        # -- Savgol Filter --
-        savgol_group = QGroupBox("Savitzky-Golay Filter Parameters")
-        savgol_layout = QGridLayout()
+        # -- Bandpass Filter --
+        filter_group = QGroupBox("Heave Isolation Filter (Butterworth Bandpass)")
+        filter_layout = QGridLayout()
 
-        savgol_layout.addWidget(QLabel("Window Length:"), 0, 0)
-        self.window_spin = QSpinBox()
-        self.window_spin.setRange(3, 1001)
-        self.window_spin.setSingleStep(2)
-        self.window_spin.setValue(51)
-        savgol_layout.addWidget(self.window_spin, 0, 1)
+        filter_layout.addWidget(QLabel("Low Freq (Hz):"), 0, 0)
+        self.low_freq_spin = QDoubleSpinBox()
+        self.low_freq_spin.setRange(0.001, 10.0)
+        self.low_freq_spin.setSingleStep(0.01)
+        self.low_freq_spin.setDecimals(3)
+        self.low_freq_spin.setValue(0.05)
+        self.low_freq_spin.setToolTip("Lower cutoff frequency. 0.05 Hz = 20 s period.")
+        filter_layout.addWidget(self.low_freq_spin, 0, 1)
 
-        savgol_layout.addWidget(QLabel("Polynomial Order:"), 1, 0)
-        self.polyorder_spin = QSpinBox()
-        self.polyorder_spin.setRange(1, 10)
-        self.polyorder_spin.setValue(3)
-        savgol_layout.addWidget(self.polyorder_spin, 1, 1)
+        filter_layout.addWidget(QLabel("High Freq (Hz):"), 1, 0)
+        self.high_freq_spin = QDoubleSpinBox()
+        self.high_freq_spin.setRange(0.01, 50.0)
+        self.high_freq_spin.setSingleStep(0.05)
+        self.high_freq_spin.setDecimals(3)
+        self.high_freq_spin.setValue(0.5)
+        self.high_freq_spin.setToolTip("Upper cutoff frequency. 0.5 Hz = 2 s period.")
+        filter_layout.addWidget(self.high_freq_spin, 1, 1)
 
-        savgol_group.setLayout(savgol_layout)
-        self._layout.addWidget(savgol_group)
+        filter_layout.addWidget(QLabel("Filter Order:"), 2, 0)
+        self.filter_order_spin = QSpinBox()
+        self.filter_order_spin.setRange(1, 10)
+        self.filter_order_spin.setValue(4)
+        self.filter_order_spin.setToolTip("Butterworth filter order (higher = steeper rolloff).")
+        filter_layout.addWidget(self.filter_order_spin, 2, 1)
+
+        filter_group.setLayout(filter_layout)
+        self._layout.addWidget(filter_group)
 
         # -- Reference Sensor --
         ref_group = QGroupBox("Reference Sensor")
@@ -168,13 +180,13 @@ class TimeOffsetPanel(BaseModePanel):
                     f"Sensor {r.sensor_label}: {r.offset_seconds:+.3f}s  (RMS: {r.rms_value:.6f})"
                 )
 
-    def get_savgol_params(self) -> tuple[int, int]:
-        """Return (window_length, polyorder)."""
-        window = self.window_spin.value()
-        if window % 2 == 0:
-            window += 1
-            self.window_spin.setValue(window)
-        return window, self.polyorder_spin.value()
+    def get_filter_params(self) -> tuple[float, float, int]:
+        """Return (low_freq, high_freq, filter_order)."""
+        return (
+            self.low_freq_spin.value(),
+            self.high_freq_spin.value(),
+            self.filter_order_spin.value(),
+        )
 
     def get_ref_sensor(self) -> str:
         return self.ref_sensor_combo.currentText()

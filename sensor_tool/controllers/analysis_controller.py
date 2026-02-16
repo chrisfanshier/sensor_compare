@@ -21,6 +21,7 @@ from ..domain.models.calibration import DepthCalibration
 from ..domain.models.analysis_result import StatisticsResult, TimeOffsetResult
 from ..domain.processing.depth_correction import DepthCorrectionProcessor
 from ..domain.processing.time_correction import TimeCorrectionProcessor
+from ..domain.processing.trip_detection import TripDetectionProcessor
 from ..domain.processing.calibration_builder import CalibrationBuilder
 from ..domain.processing.statistics import compute_statistics
 from ..persistence.csv_loader import CSVLoader
@@ -43,20 +44,26 @@ class AnalysisController:
         self.calibration: Optional[DepthCalibration] = None
         self.generated_calibration: Optional[DepthCalibration] = None
         self.time_offset_results: Optional[list[TimeOffsetResult]] = None
+        self._heave_profiles: Optional[dict[str, np.ndarray]] = None
+        self._heave_time_axis: Optional[np.ndarray] = None
+        self._heave_fs: Optional[float] = None
+        self._heave_sel: Optional[tuple[int, int]] = None
         self.collected_statistics: list[StatisticsResult] = []
 
         # GUI references (set by main_window after construction)
         self.main_window = None
         self.main_plot = None
-        self.secondary_view = None  # velocity plot or stats table
-        self.velocity_plot = None
+        self.secondary_view = None  # heave plot or stats table
+        self.heave_plot = None
         self.statistics_table = None
+        self.trip_plot = None
 
         # Panels
         self.view_panel = None
         self.depth_panel = None
         self.time_panel = None
         self.calibration_panel = None
+        self.trip_panel = None
 
     # ==================================================================
     # Initialization - called by MainWindow
@@ -109,6 +116,11 @@ class AnalysisController:
         # Main plot selection signal
         self.main_plot.selection_changed.connect(self._on_selection_changed)
         self.main_plot.selection_cleared.connect(self._on_selection_cleared)
+
+        # Trip Detector panel
+        self.trip_panel.load_file_requested.connect(self.load_export_csv)
+        self.trip_panel.detect_trip_requested.connect(self.detect_trip)
+        self.trip_panel.plot_original_requested.connect(self.plot_depths)
 
     # ==================================================================
     # Data Loading
@@ -367,7 +379,7 @@ class AnalysisController:
     # ==================================================================
 
     def calculate_time_offsets(self):
-        """Calculate time offsets using Savgol velocity difference method."""
+        """Calculate time offsets using heave cross-correlation method."""
         if self.sensor_data is None:
             self._show_warning("No data loaded")
             return
@@ -380,31 +392,58 @@ class AnalysisController:
         try:
             start_idx, end_idx = sel
             panel = self.time_panel
-            window, polyorder = panel.get_savgol_params()
+            low_freq, high_freq, filter_order = panel.get_filter_params()
             ref_sensor = panel.get_ref_sensor()
 
             panel.log_widget.log(f"\n{'='*50}")
-            panel.log_widget.log("CALCULATING TIME OFFSETS")
+            panel.log_widget.log("CALCULATING TIME OFFSETS (Heave Cross-Correlation)")
             panel.log_widget.log(f"Range: rows {start_idx}-{end_idx}")
-            panel.log_widget.log(f"Savgol: window={window}, polyorder={polyorder}")
+            panel.log_widget.log(f"Bandpass: {low_freq:.3f}-{high_freq:.3f} Hz, order {filter_order}")
             panel.log_widget.log(f"Reference: Sensor {ref_sensor}")
             panel.log_widget.log(f"{'='*50}")
 
+            # Compute heave profiles for visualization
+            heaves, fs = TimeCorrectionProcessor.compute_heave_profiles(
+                self.sensor_data, start_idx, end_idx,
+                low_freq, high_freq, filter_order,
+            )
+            self._heave_profiles = heaves
+            self._heave_fs = fs
+            self._heave_sel = (start_idx, end_idx)
+
+            panel.log_widget.log(f"Sampling rate: {fs:.2f} Hz ({1/fs:.4f}s interval)")
+
+            # Build a relative-seconds time axis for the selection
+            dt_col = self.sensor_data.datetime_col
+            df_sel = self.sensor_data.df.iloc[start_idx:end_idx + 1]
+            timestamps = pd.to_datetime(df_sel[dt_col])
+            t_sec = (timestamps - timestamps.iloc[0]).dt.total_seconds().values
+            self._heave_time_axis = t_sec
+
+            # Calculate offsets
             self.time_offset_results = TimeCorrectionProcessor.calculate_offsets(
                 self.sensor_data, start_idx, end_idx,
-                ref_sensor, window, polyorder,
+                ref_sensor, low_freq, high_freq, filter_order,
             )
 
             for r in self.time_offset_results:
                 if r.is_reference:
-                    panel.log_widget.log(f"Sensor {r.sensor_label}: 0.000s (reference)")
+                    panel.log_widget.log(f"Sensor {r.sensor_label}: 0.0000s (reference)")
                 else:
                     panel.log_widget.log(
-                        f"Sensor {r.sensor_label}: {r.offset_seconds:+.3f}s "
-                        f"(RMS: {r.rms_value:.6f})"
+                        f"Sensor {r.sensor_label}: {r.offset_seconds:+.4f}s "
+                        f"(heave RMS: {r.rms_value:.6f}m)"
                     )
 
             panel.display_offsets(self.time_offset_results)
+
+            # Show uncorrected heave on secondary plot
+            if self.heave_plot is not None:
+                self.heave_plot.plot_heave_uncorrected(
+                    heaves, ref_sensor, time_axis=t_sec,
+                )
+                self.main_window.show_secondary_view('heave')
+
             panel.log_widget.log("Offset calculation complete!")
 
         except Exception as e:
@@ -432,7 +471,7 @@ class AnalysisController:
             suffixes = {}
             for r in self.time_offset_results:
                 if not r.is_reference:
-                    suffixes[r.sensor_label] = f" ({r.offset_seconds:+.3f}s)"
+                    suffixes[r.sensor_label] = f" ({r.offset_seconds:+.4f}s)"
                 else:
                     suffixes[r.sensor_label] = " (ref)"
 
@@ -441,21 +480,38 @@ class AnalysisController:
                 title=self.sensor_data.core_title or 'Time-Corrected',
             )
 
-            # Update velocity plot
-            if self.velocity_plot is not None:
-                ref = panel.get_ref_sensor()
-                window, polyorder = panel.get_savgol_params()
-                v_diffs = TimeCorrectionProcessor.compute_velocity_differences(
-                    self.sensor_data, ref, window, polyorder
+            # Update heave plot to show corrected alignment
+            if (self.heave_plot is not None
+                    and self._heave_profiles is not None
+                    and self._heave_sel is not None):
+                ref_sensor = panel.get_ref_sensor()
+                low_freq, high_freq, filter_order = panel.get_filter_params()
+                start_idx, end_idx = self._heave_sel
+
+                # Recompute heave on the corrected data for the same range
+                heaves_corrected, _ = TimeCorrectionProcessor.compute_heave_profiles(
+                    self.sensor_data, start_idx, end_idx,
+                    low_freq, high_freq, filter_order,
                 )
-                self.velocity_plot.plot_velocity_differences(
-                    self.sensor_data, v_diffs, ref
+
+                offsets_dict = {
+                    r.sensor_label: r.offset_seconds
+                    for r in self.time_offset_results
+                    if not r.is_reference
+                }
+
+                self.heave_plot.plot_heave_corrected(
+                    heaves_original=self._heave_profiles,
+                    heaves_corrected=heaves_corrected,
+                    ref_sensor=ref_sensor,
+                    offsets=offsets_dict,
+                    time_axis=self._heave_time_axis,
                 )
 
             for r in self.time_offset_results:
                 if not r.is_reference:
                     panel.log_widget.log(
-                        f"Applied {r.offset_seconds:+.3f}s shift to Sensor {r.sensor_label}"
+                        f"Applied {r.offset_seconds:+.4f}s shift to Sensor {r.sensor_label}"
                     )
             panel.log_widget.log("Time corrections applied!")
 
@@ -629,6 +685,81 @@ class AnalysisController:
             self._show_error("Save Error", str(e))
 
     # ==================================================================
+    # Trip Detector Mode
+    # ==================================================================
+
+    def detect_trip(self):
+        """Detect sensor trip point using Savitzky-Golay divergence."""
+        if self.sensor_data is None:
+            self._show_warning("No data loaded")
+            return
+
+        try:
+            panel = self.trip_panel
+            sg_window, sg_poly = panel.get_sg_params()
+            deriv_order = panel.get_derivative_order()
+            threshold = panel.get_threshold()
+            sampling_rate = panel.get_sampling_rate()
+            edge_buffer = panel.get_edge_buffer()
+
+            panel.log_widget.log(f"\n{'='*50}")
+            panel.log_widget.log("TRIP DETECTION")
+            panel.log_widget.log(f"SG window={sg_window}, poly={sg_poly}")
+            panel.log_widget.log(f"Derivative order={deriv_order}")
+            panel.log_widget.log(f"Threshold={threshold}, Rate={sampling_rate} Hz")
+            panel.log_widget.log(f"Edge buffer={edge_buffer} samples")
+            panel.log_widget.log(f"{'='*50}")
+
+            # Build depth arrays (interpolated)
+            depths = {}
+            for label in self.sensor_data.sensor_labels:
+                col = f'Sensor_{label}_Depth'
+                if col in self.sensor_data.df.columns:
+                    vals = self.sensor_data.df[col].interpolate().ffill().bfill().values
+                    depths[label] = vals
+
+            if len(depths) < 2:
+                self._show_warning("Need at least 2 sensors for trip detection")
+                return
+
+            timestamps = self.sensor_data.get_timestamps()
+
+            result = TripDetectionProcessor.detect_trip(
+                depths, timestamps,
+                sg_window=sg_window,
+                sg_poly=sg_poly,
+                derivative_order=deriv_order,
+                std_threshold=threshold,
+                sampling_rate=sampling_rate,
+                edge_buffer=edge_buffer,
+            )
+
+            # Log results
+            panel.log_widget.log(f"\n{result.summary}")
+            panel.display_result(result.summary)
+
+            # Build short names for display
+            short_names = {
+                label: self.sensor_data.get_original_short_name(label)
+                for label in self.sensor_data.sensor_labels
+            }
+
+            # Show trip line on the main depth plot
+            self.plot_depths()
+            self.main_plot.add_trip_line(result.trip_index)
+
+            # Show derivative plots on secondary view
+            if self.trip_plot is not None:
+                self.trip_plot.plot_trip_result(result, sensor_short_names=short_names)
+                self.main_window.show_secondary_view('trip')
+
+            panel.log_widget.log("Trip detection complete!")
+
+        except Exception as e:
+            self._show_error("Trip Detection Error", str(e))
+            self.trip_panel.log_widget.log(f"ERROR: {e}")
+
+    # ==================================================================
     # Common Operations
     # ==================================================================
 
@@ -713,14 +844,30 @@ class AnalysisController:
 
     def on_mode_changed(self, mode_name: str):
         """Called by MainWindow when mode changes."""
-        # Show/hide secondary view
         if self.main_window is None:
             return
 
+        # Disable selection mode when leaving a selection-enabled mode
+        self.main_plot.selection_mode = False
+        # Reset toggle buttons on panels that have selection controls
+        if self.time_panel is not None:
+            self.time_panel.selection_controls.toggle_btn.setChecked(False)
+            self.time_panel.selection_controls._on_toggled()
+        if self.calibration_panel is not None:
+            self.calibration_panel.selection_controls.toggle_btn.setChecked(False)
+            self.calibration_panel.selection_controls._on_toggled()
+
+        # Clear selection region when entering non-selection modes
+        if mode_name not in ('Time Offset', 'Create Calibration'):
+            self.main_plot.clear_selection()
+
+        # Show/hide secondary view
         if mode_name == 'Time Offset':
-            self.main_window.show_secondary_view('velocity')
+            self.main_window.show_secondary_view('heave')
         elif mode_name == 'Create Calibration':
             self.main_window.show_secondary_view('statistics')
+        elif mode_name == 'Trip Detector':
+            self.main_window.show_secondary_view('trip')
         else:
             self.main_window.hide_secondary_view()
 
@@ -753,6 +900,10 @@ class AnalysisController:
         self.time_panel.update_file_info(
             sd.source_file, sd.num_sensors, sd.row_count,
         )
+        if self.trip_panel is not None:
+            self.trip_panel.update_file_info(
+                sd.source_file, sd.num_sensors, sd.row_count,
+            )
 
         # Set up sensor assignments with ORIGINAL column names
         if sd.num_sensors > 0 and sd.original_depth_columns:
@@ -791,6 +942,8 @@ class AnalysisController:
             self.time_panel.log_widget.log(msg)
         elif mode == 'Create Calibration':
             self.calibration_panel.log_widget.log(msg)
+        elif mode == 'Trip Detector':
+            self.trip_panel.log_widget.log(msg)
 
     def _show_error(self, title: str, msg: str):
         if self.main_window:

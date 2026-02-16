@@ -213,6 +213,40 @@ class SensorPlotView(QWidget):
     def clear(self):
         """Clear the plot."""
         self._clear_plot()
+        self._trip_line = None
+
+    def add_trip_line(self, trip_index: int):
+        """Add a dashed red vertical line at the detected trip index.
+
+        Converts the sample index to the appropriate x-axis value
+        (epoch timestamp if using datetime axis, else sample index).
+        """
+        if self._sensor_data is None:
+            return
+
+        if self._use_datetime_axis:
+            timestamps = self._sensor_data.get_timestamps_epoch()
+            if 0 <= trip_index < len(timestamps):
+                x_pos = float(timestamps[trip_index])
+            else:
+                return
+        else:
+            x_pos = float(trip_index)
+
+        # Remove previous trip line if any
+        if hasattr(self, '_trip_line') and self._trip_line is not None:
+            try:
+                self.plot_widget.removeItem(self._trip_line)
+            except Exception:
+                pass
+
+        self._trip_line = pg.InfiniteLine(
+            pos=x_pos, angle=90,
+            pen=pg.mkPen('r', width=2, style=Qt.DashLine),
+            label='Trip',
+            labelOpts={'position': 0.9, 'color': 'r'},
+        )
+        self.plot_widget.addItem(self._trip_line)
 
     # ------------------------------------------------------------------
     # Selection mode
