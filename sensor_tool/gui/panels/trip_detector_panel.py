@@ -24,11 +24,13 @@ class TripDetectorPanel(BaseModePanel):
         load_file_requested(str): User selected a CSV file.
         detect_trip_requested: User clicked "Detect Trip".
         plot_original_requested: User clicked "Plot Original Data".
+        export_requested: User clicked "Export Corrected Data".
     """
 
     load_file_requested = Signal(str)
     detect_trip_requested = Signal()
     plot_original_requested = Signal()
+    export_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -150,6 +152,14 @@ class TripDetectorPanel(BaseModePanel):
         )
         detect_btn.clicked.connect(self.detect_trip_requested.emit)
         action_layout.addWidget(detect_btn)
+
+        export_btn = QPushButton("Export Corrected Data")
+        export_btn.clicked.connect(self.export_requested.emit)
+        export_btn.setToolTip(
+            "Export data with trip detection metadata and "
+            "applied corrections to CSV file"
+        )
+        action_layout.addWidget(export_btn)
 
         action_group.setLayout(action_layout)
         self._layout.addWidget(action_group)

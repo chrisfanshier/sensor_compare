@@ -41,9 +41,11 @@ class AnalysisController:
         self.sensor_data: Optional[SensorData] = None      # Primary data
         self.original_data: Optional[SensorData] = None     # Backup for reset
         self._raw_loaded_data: Optional[SensorData] = None  # Pristine copy for reassignment
+        self._loaded_file_path: Optional[str] = None        # Full path to loaded file
         self.calibration: Optional[DepthCalibration] = None
         self.generated_calibration: Optional[DepthCalibration] = None
         self.time_offset_results: Optional[list[TimeOffsetResult]] = None
+        self.trip_detection_result = None
         self._heave_profiles: Optional[dict[str, np.ndarray]] = None
         self._heave_time_axis: Optional[np.ndarray] = None
         self._heave_fs: Optional[float] = None
@@ -121,6 +123,7 @@ class AnalysisController:
         self.trip_panel.load_file_requested.connect(self.load_export_csv)
         self.trip_panel.detect_trip_requested.connect(self.detect_trip)
         self.trip_panel.plot_original_requested.connect(self.plot_depths)
+        self.trip_panel.export_requested.connect(self.export_trip_csv)
 
     # ==================================================================
     # Data Loading
@@ -136,6 +139,8 @@ class AnalysisController:
             self.original_data = self.sensor_data.copy()
             # Also keep a pristine copy for reassignment (before any remap)
             self._raw_loaded_data = self.sensor_data.copy()
+            # Store full path for later export
+            self._loaded_file_path = file_path
             self._update_all_panels_file_info()
             self.main_plot.set_sensor_data(self.sensor_data)
             self.plot_depths()
@@ -738,6 +743,9 @@ class AnalysisController:
             panel.log_widget.log(f"\n{result.summary}")
             panel.display_result(result.summary)
 
+            # Store result for export
+            self.trip_detection_result = result
+
             # Build short names for display
             short_names = {
                 label: self.sensor_data.get_original_short_name(label)
@@ -796,6 +804,113 @@ class AnalysisController:
             )
         except Exception as e:
             self._show_error("Export Error", str(e))
+
+    def export_trip_csv(self):
+        """Export the current sensor data with trip detection metadata."""
+        if self.sensor_data is None:
+            self._show_warning("No data to export")
+            return
+
+        if self.trip_detection_result is None:
+            self._show_warning("No trip detection has been performed yet")
+            return
+
+        # Generate default filename
+        core_name = self.sensor_data.core_title.replace(' ', '_') if self.sensor_data.core_title else 'data'
+        timestamp = pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')
+        default_name = f"{core_name}_corrected_{timestamp}.csv"
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self.main_window, "Export Trip Data", default_name,
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if not file_path:
+            return
+
+        try:
+            self._write_trip_csv(file_path)
+            self._log_active(f"Exported to {Path(file_path).name}")
+            QMessageBox.information(
+                self.main_window, "Success",
+                f"Data exported with trip metadata!\n\n"
+                f"Trip detected at: {self.trip_detection_result.trip_datetime}"
+            )
+        except Exception as e:
+            self._show_error("Export Error", str(e))
+
+    def _write_trip_csv(self, file_path: str):
+        """Write CSV with full metadata header including trip and corrections."""
+        from datetime import datetime
+        
+        # Get the original file path to read metadata
+        header_lines = []
+        
+        # Try to read original header from source file
+        if self._loaded_file_path and Path(self._loaded_file_path).exists():
+            try:
+                with open(self._loaded_file_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if line.startswith('#') and not line.strip() == '#':
+                            header_lines.append(line.rstrip())
+                        elif line.strip().startswith('datetime'):
+                            break  # Stop at data header
+            except:
+                pass  # If we can't read it, we'll generate basic header
+        
+        # If we couldn't read the original or it's a different file, create basic header
+        if not header_lines:
+            header_lines = [
+                "# Export from Sediment App - Sensor Alignment Tool",
+                f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            ]
+            if self.sensor_data.core_title:
+                header_lines.append(f"# Core: {self.sensor_data.core_title}")
+            header_lines.extend([
+                f"# Data shape: {self.sensor_data.row_count:,} rows × {len(self.sensor_data.df.columns)} columns",
+            ])
+            time_range = self.sensor_data.time_range
+            if time_range:
+                header_lines.append(f"# Time range: {time_range[0]} to {time_range[1]}")
+        
+        # Add trip detection info
+        trip = self.trip_detection_result
+        header_lines.append("#")
+        header_lines.append(f"# Trip detected at: {trip.trip_datetime} (index: {trip.trip_index})")
+        
+        # Add correction information
+        if self.sensor_data.corrections:
+            header_lines.append("#")
+            time_corrections = [c for c in self.sensor_data.corrections if c.correction_type == 'time_shift']
+            depth_corrections = [c for c in self.sensor_data.corrections 
+                                if c.correction_type in ('depth_calibration', 'depth_manual')]
+            
+            if time_corrections:
+                header_lines.append("# Time corrections applied:")
+                for corr in time_corrections:
+                    shift = corr.parameters.get('shift_seconds', 0)
+                    sign = '+' if shift >= 0 else ''
+                    header_lines.append(f"#   Sensor {corr.sensor_label}: {sign}{shift:.2f}s")
+            
+            if depth_corrections:
+                header_lines.append("# Depth corrections applied:")
+                for corr in depth_corrections:
+                    offset = corr.parameters.get('offset', 0)
+                    sign = '+' if offset >= 0 else ''
+                    header_lines.append(f"#   Sensor {corr.sensor_label}: {sign}{offset:.3f}m")
+        else:
+            header_lines.append("#")
+            header_lines.append("# No corrections applied")
+        
+        header_lines.append("#")
+        
+        # Write file
+        with open(file_path, 'w', encoding='utf-8', newline='') as f:
+            # Write header
+            for line in header_lines:
+                f.write(line + '\n')
+            
+            # Write data
+            self.sensor_data.df.to_csv(f, index=False)
 
     # ==================================================================
     # Selection handling
