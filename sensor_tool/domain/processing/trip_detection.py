@@ -22,9 +22,9 @@ class TripDetectionResult:
     derivative_order: int
     derivative_label: str
     threshold: float
-    derivative_profiles: dict[str, np.ndarray]   # label -> savgol derivative
+    derivative_profiles: dict[str, np.ndarray]   # depth_column -> savgol derivative
     divergence: np.ndarray                        # std across sensors
-    sensor_labels: list[str]
+    depth_columns: list[str]                      # depth column names used
 
     @property
     def summary(self) -> str:
@@ -63,7 +63,7 @@ class TripDetectionProcessor:
         Detect the trip point where sensor derivatives diverge.
 
         Args:
-            depths: Dict mapping sensor_label -> depth array (interpolated).
+            depths: Dict mapping depth_column_name -> depth array.
             timestamps: Datetime series aligned with depth arrays.
             sg_window: Savitzky-Golay window length (must be odd).
             sg_poly: Savitzky-Golay polynomial order.
@@ -76,10 +76,9 @@ class TripDetectionProcessor:
             TripDetectionResult with trip index, profiles, and divergence.
         """
         dt = 1.0 / sampling_rate
-        labels = list(depths.keys())
-        depth_arrays = np.array([depths[lbl] for lbl in labels])
+        columns = list(depths.keys())
+        depth_arrays = np.array([depths[col] for col in columns])
 
-        # Compute Savitzky-Golay derivative for each sensor
         d_depths = np.array([
             signal.savgol_filter(
                 d,
@@ -91,18 +90,14 @@ class TripDetectionProcessor:
             for d in depth_arrays
         ])
 
-        # Build profiles dict
-        profiles = {lbl: d_depths[i] for i, lbl in enumerate(labels)}
+        profiles = {col: d_depths[i] for i, col in enumerate(columns)}
 
-        # Divergence = std dev across sensors at each sample
         divergence = np.std(d_depths, axis=0)
 
-        # Mask edges
         div_masked = divergence.copy()
         div_masked[:edge_buffer] = 0
         div_masked[-edge_buffer:] = 0
 
-        # Find trip point
         above = np.where(div_masked > std_threshold)[0]
         if len(above) > 0:
             trip_idx = int(above[0])
@@ -122,5 +117,5 @@ class TripDetectionProcessor:
             threshold=std_threshold,
             derivative_profiles=profiles,
             divergence=divergence,
-            sensor_labels=labels,
+            depth_columns=columns,
         )

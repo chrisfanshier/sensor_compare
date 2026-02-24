@@ -37,27 +37,16 @@ class TimeCorrectionProcessor:
 
         1. Detrend with a 2nd-order polynomial.
         2. Bandpass filter to retain only heave frequencies.
-
-        Args:
-            series: Raw depth values.
-            fs: Sampling frequency (Hz).
-            low_freq: Lower cutoff frequency (Hz).  Default 0.05 → 20 s period.
-            high_freq: Upper cutoff frequency (Hz). Default 0.50 → 2 s period.
-            order: Butterworth filter order.
-
-        Returns:
-            Filtered heave signal (same length as input).
         """
         x = np.arange(len(series))
         p = np.polyfit(x, series, 2)
         detrended = series - np.polyval(p, x)
 
-        # Clamp frequencies to valid Nyquist range
         nyquist = fs / 2.0
         low = max(low_freq, 0.001)
         high = min(high_freq, nyquist * 0.99)
         if low >= high:
-            return detrended  # fallback: just return detrended
+            return detrended
 
         sos = sp_signal.butter(order, [low, high], 'bp', fs=fs, output='sos')
         return sp_signal.sosfiltfilt(sos, detrended)
@@ -72,24 +61,14 @@ class TimeCorrectionProcessor:
         Compute time offset between two heave signals via cross-correlation
         with parabolic sub-sample refinement.
 
-        Args:
-            ref_heave: Reference sensor heave signal.
-            mov_heave: Moving sensor heave signal.
-            fs: Sampling frequency (Hz).
-
         Returns:
             (offset_seconds, correlation, lags_seconds)
-            - offset_seconds: Time to shift mov to align with ref.
-              Positive means mov is delayed (shift left in time).
-            - correlation: Full cross-correlation array.
-            - lags_seconds: Corresponding lag values in seconds.
         """
         corr = sp_signal.correlate(ref_heave, mov_heave, mode='full')
         lags = sp_signal.correlation_lags(len(ref_heave), len(mov_heave), mode='full')
 
         idx = int(np.argmax(np.abs(corr)))
 
-        # Parabolic (sub-sample) refinement
         if 0 < idx < len(corr) - 1:
             y_p = corr[idx - 1]
             y_0 = corr[idx]
@@ -112,7 +91,7 @@ class TimeCorrectionProcessor:
         sensor_data: SensorData,
         start_idx: int,
         end_idx: int,
-        ref_sensor: str,
+        ref_col: str,
         low_freq: float = 0.05,
         high_freq: float = 0.5,
         filter_order: int = 4,
@@ -120,13 +99,11 @@ class TimeCorrectionProcessor:
         """
         Calculate optimal time offsets for each non-reference sensor.
 
-        Uses the selection range to isolate heave and cross-correlate.
-
         Args:
             sensor_data: The full dataset.
             start_idx: Start row index of the selected range (inclusive).
             end_idx: End row index of the selected range (inclusive).
-            ref_sensor: Reference sensor label.
+            ref_col: Reference depth column name.
             low_freq: Bandpass lower cutoff (Hz).
             high_freq: Bandpass upper cutoff (Hz).
             filter_order: Butterworth filter order.
@@ -135,36 +112,28 @@ class TimeCorrectionProcessor:
             List of TimeOffsetResult for each sensor.
         """
         datetime_col = sensor_data.datetime_col
-        sensor_labels = sensor_data.sensor_labels
         depth_cols = sensor_data.depth_columns
-        ref_idx = sensor_labels.index(ref_sensor)
-        ref_col = depth_cols[ref_idx]
 
-        # Extract selected range
         df_sel = sensor_data.df.iloc[start_idx:end_idx + 1].copy()
 
-        # Determine sampling frequency
         dt = pd.to_datetime(df_sel[datetime_col]).diff().dt.total_seconds()
         median_dt = dt.median()
         if median_dt <= 0:
-            raise ValueError("Cannot determine sampling rate — timestamps are not monotonic.")
+            raise ValueError("Cannot determine sampling rate.")
         fs = 1.0 / median_dt
 
-        # Compute ref heave
         ref_data = df_sel[ref_col].values.astype(float)
         if np.all(np.isnan(ref_data)):
-            raise ValueError(f"Reference sensor {ref_sensor} has no valid data in selection.")
+            raise ValueError(f"Reference sensor has no valid data in selection.")
         ref_heave = TimeCorrectionProcessor.get_heave(
             ref_data, fs, low_freq, high_freq, filter_order
         )
 
         results = []
-        for i, col in enumerate(depth_cols):
-            label = sensor_labels[i]
-
-            if i == ref_idx:
+        for col in depth_cols:
+            if col == ref_col:
                 results.append(TimeOffsetResult(
-                    sensor_label=label,
+                    sensor_column=col,
                     offset_seconds=0.0,
                     rms_value=0.0,
                     is_reference=True,
@@ -177,7 +146,7 @@ class TimeCorrectionProcessor:
             mov_data = df_sel[col].values.astype(float)
             if np.all(np.isnan(mov_data)):
                 results.append(TimeOffsetResult(
-                    sensor_label=label,
+                    sensor_column=col,
                     offset_seconds=0.0,
                     rms_value=float('nan'),
                 ))
@@ -191,7 +160,6 @@ class TimeCorrectionProcessor:
                 ref_heave, mov_heave, fs
             )
 
-            # Compute RMS of heave residual after alignment
             shift_samples = int(round(offset_sec * fs))
             n = len(ref_heave)
             if abs(shift_samples) < n:
@@ -208,7 +176,7 @@ class TimeCorrectionProcessor:
                 rms = float('nan')
 
             results.append(TimeOffsetResult(
-                sensor_label=label,
+                sensor_column=col,
                 offset_seconds=offset_sec,
                 rms_value=rms,
             ))
@@ -229,7 +197,7 @@ class TimeCorrectionProcessor:
 
         Returns:
             (heaves, fs)
-            heaves: Dict mapping sensor_label -> heave array (same length as selection).
+            heaves: Dict mapping depth_column -> heave array.
             fs: Sampling frequency in Hz.
         """
         datetime_col = sensor_data.datetime_col
@@ -239,11 +207,10 @@ class TimeCorrectionProcessor:
         fs = 1.0 / dt.median()
 
         heaves = {}
-        for label in sensor_data.sensor_labels:
-            col = f'Sensor_{label}_Depth'
+        for col in sensor_data.depth_columns:
             if col in df_sel.columns:
                 data = df_sel[col].values.astype(float)
-                heaves[label] = TimeCorrectionProcessor.get_heave(
+                heaves[col] = TimeCorrectionProcessor.get_heave(
                     data, fs, low_freq, high_freq, filter_order
                 )
         return heaves, fs
@@ -256,14 +223,6 @@ class TimeCorrectionProcessor:
     ) -> np.ndarray:
         """
         Shift a time series by a sub-sample offset using linear interpolation.
-
-        Args:
-            time_seconds: Time axis in seconds (relative, monotonic).
-            values: Data values.
-            offset_seconds: Amount to shift (positive = data was delayed).
-
-        Returns:
-            Shifted values on the original time grid.
         """
         t_target = time_seconds + offset_seconds
         return np.interp(time_seconds, t_target, values)
@@ -281,7 +240,6 @@ class TimeCorrectionProcessor:
         datetime_col = sensor_data.datetime_col
         corrected_df = sensor_data.df.copy()
 
-        # Build a relative-seconds time axis
         timestamps = pd.to_datetime(corrected_df[datetime_col])
         t_sec = (timestamps - timestamps.iloc[0]).dt.total_seconds().values
 
@@ -289,7 +247,7 @@ class TimeCorrectionProcessor:
             if result.is_reference or result.offset_seconds == 0.0:
                 continue
 
-            col = f'Sensor_{result.sensor_label}_Depth'
+            col = result.sensor_column
             if col not in corrected_df.columns:
                 continue
 
@@ -304,7 +262,7 @@ class TimeCorrectionProcessor:
             if not result.is_reference and result.offset_seconds != 0.0:
                 new_data.add_correction(CorrectionRecord(
                     correction_type='time_shift',
-                    sensor_label=result.sensor_label,
+                    sensor_column=result.sensor_column,
                     description=f"Time shift: {result.offset_seconds:+.4f}s (heave cross-correlation)",
                     parameters={
                         'offset_seconds': result.offset_seconds,

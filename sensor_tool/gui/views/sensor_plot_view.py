@@ -27,14 +27,15 @@ SENSOR_COLORS_QT = ['b', 'g', 'r', 'm', 'c', 'y']
 class SensorPlotView(QWidget):
     """
     Persistent main plot widget displaying depth vs time.
-    
+
     Signals:
-        selection_changed(int, int): Emitted when a selection is completed (start_idx, end_idx).
+        selection_changed(int, int): Emitted when a selection is completed.
         selection_cleared: Emitted when selection is cleared.
     """
 
     selection_changed = Signal(int, int)
     selection_cleared = Signal()
+    start_core_changed = Signal(int)
 
     def __init__(self, parent=None, use_datetime_axis: bool = True):
         super().__init__(parent)
@@ -48,6 +49,8 @@ class SensorPlotView(QWidget):
         self._selection_region: pg.LinearRegionItem | None = None
         self._use_datetime_axis = use_datetime_axis
         self._y_inverted = False
+        self._piston_plot_item = None
+        self._start_core_line: pg.InfiniteLine | None = None
 
         self._setup_ui()
 
@@ -55,14 +58,12 @@ class SensorPlotView(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # Info label (crosshair readout)
         self.info_label = QLabel('')
         self.info_label.setStyleSheet(
             'QLabel { background-color: white; padding: 5px; border: 1px solid gray; }'
         )
         layout.addWidget(self.info_label)
 
-        # Plot widget
         pg.setConfigOptions(antialias=True, useOpenGL=True)
         if self._use_datetime_axis:
             date_axis = pg.graphicsItems.DateAxisItem.DateAxisItem(orientation='bottom')
@@ -77,11 +78,9 @@ class SensorPlotView(QWidget):
         self.plot_widget.addLegend()
         self.plot_widget.setLabel('left', 'Depth (m)')
 
-        # Performance
         self.plot_widget.setDownsampling(auto=True, mode='peak')
         self.plot_widget.setClipToView(True)
 
-        # Crosshairs
         self._vline = pg.InfiniteLine(
             angle=90, movable=False,
             pen=pg.mkPen('r', width=1, style=Qt.DashLine)
@@ -97,7 +96,6 @@ class SensorPlotView(QWidget):
 
         layout.addWidget(self.plot_widget)
 
-        # Mouse events
         self._mouse_proxy = pg.SignalProxy(
             self.plot_widget.scene().sigMouseMoved,
             rateLimit=60,
@@ -110,7 +108,6 @@ class SensorPlotView(QWidget):
     # ------------------------------------------------------------------
 
     def set_sensor_data(self, sensor_data: SensorData | None):
-        """Set the current sensor data (does not auto-plot)."""
         self._sensor_data = sensor_data
 
     def plot_depths(self, sensor_data: SensorData | None = None, title: str = ''):
@@ -128,16 +125,16 @@ class SensorPlotView(QWidget):
 
         x = self._sensor_data.get_timestamps_epoch()
 
-        for i, label in enumerate(self._sensor_data.sensor_labels):
-            col = f'Sensor_{label}_Depth'
+        for i, col in enumerate(self._sensor_data.depth_columns):
             if col not in self._sensor_data.df.columns:
                 continue
             data = self._sensor_data.df[col].values
             if np.sum(~np.isnan(data)) == 0:
                 continue
             pen = pg.mkPen(color=SENSOR_COLORS[i % len(SENSOR_COLORS)], width=2)
+            display_name = SensorData.get_location_name(col)
             self.plot_widget.plot(
-                x, data, pen=pen, name=f'Sensor {label}',
+                x, data, pen=pen, name=display_name,
                 connect='finite', skipFiniteCheck=True,
             )
 
@@ -151,7 +148,10 @@ class SensorPlotView(QWidget):
         label_suffix: dict[str, str] | None = None,
         title: str = '',
     ):
-        """Plot depths with custom label suffixes (e.g., showing offsets)."""
+        """Plot depths with custom label suffixes (e.g., showing offsets).
+
+        label_suffix keys are depth column names.
+        """
         self._sensor_data = sensor_data
         self._clear_plot()
 
@@ -161,13 +161,13 @@ class SensorPlotView(QWidget):
 
         x = sensor_data.get_timestamps_epoch()
 
-        for i, label in enumerate(sensor_data.sensor_labels):
-            col = f'Sensor_{label}_Depth'
+        for i, col in enumerate(sensor_data.depth_columns):
             if col not in sensor_data.df.columns:
                 continue
             data = sensor_data.df[col].values
-            suffix = (label_suffix or {}).get(label, '')
-            name = f'Sensor {label}{suffix}'
+            suffix = (label_suffix or {}).get(col, '')
+            display_name = SensorData.get_location_name(col)
+            name = f'{display_name}{suffix}'
             pen = pg.mkPen(color=SENSOR_COLORS[i % len(SENSOR_COLORS)], width=2)
             self.plot_widget.plot(
                 x, data, pen=pen, name=name,
@@ -192,17 +192,18 @@ class SensorPlotView(QWidget):
         diffs = self._sensor_data.compute_pairwise_differences()
         x = np.arange(len(self._sensor_data.df))
 
-        for idx, ((label_j, label_i), series) in enumerate(diffs.items()):
+        for idx, ((col_j, col_i), series) in enumerate(diffs.items()):
             pen = pg.mkPen(
                 color=SENSOR_COLORS_QT[idx % len(SENSOR_COLORS_QT)], width=2
             )
+            name_j = SensorData.get_short_name(col_j)
+            name_i = SensorData.get_short_name(col_i)
             self.plot_widget.plot(
                 x, series.values, pen=pen,
-                name=f'{label_j} - {label_i}',
+                name=f'{name_j} - {name_i}',
                 connect='finite', skipFiniteCheck=True,
             )
 
-        # Zero line
         pen_zero = pg.mkPen('k', width=1, style=Qt.DashLine)
         self.plot_widget.plot([0, len(self._sensor_data.df) - 1], [0, 0], pen=pen_zero)
 
@@ -211,16 +212,10 @@ class SensorPlotView(QWidget):
         self._draw_selection()
 
     def clear(self):
-        """Clear the plot."""
         self._clear_plot()
         self._trip_line = None
 
     def add_trip_line(self, trip_index: int):
-        """Add a dashed red vertical line at the detected trip index.
-
-        Converts the sample index to the appropriate x-axis value
-        (epoch timestamp if using datetime axis, else sample index).
-        """
         if self._sensor_data is None:
             return
 
@@ -233,7 +228,6 @@ class SensorPlotView(QWidget):
         else:
             x_pos = float(trip_index)
 
-        # Remove previous trip line if any
         if hasattr(self, '_trip_line') and self._trip_line is not None:
             try:
                 self.plot_widget.removeItem(self._trip_line)
@@ -247,6 +241,69 @@ class SensorPlotView(QWidget):
             labelOpts={'position': 0.9, 'color': 'r'},
         )
         self.plot_widget.addItem(self._trip_line)
+
+    # ------------------------------------------------------------------
+    # Piston position helpers
+    # ------------------------------------------------------------------
+
+    def add_piston_trace(self, x: np.ndarray, piston_depths: np.ndarray):
+        self.remove_piston_trace()
+        pen = pg.mkPen(color='#e41a1c', width=2, style=Qt.DashDotLine)
+        self._piston_plot_item = self.plot_widget.plot(
+            x, piston_depths, pen=pen, name='Piston',
+            connect='finite', skipFiniteCheck=True,
+        )
+
+    def update_piston_trace(self, piston_depths: np.ndarray):
+        if self._piston_plot_item is not None and self._sensor_data is not None:
+            x = self._sensor_data.get_timestamps_epoch()
+            self._piston_plot_item.setData(x, piston_depths)
+
+    def remove_piston_trace(self):
+        if self._piston_plot_item is not None:
+            try:
+                self.plot_widget.removeItem(self._piston_plot_item)
+            except Exception:
+                pass
+            self._piston_plot_item = None
+
+    def add_start_core_line(self, x_pos: float):
+        self.remove_start_core_line()
+        self._start_core_line = pg.InfiniteLine(
+            pos=x_pos, angle=90, movable=True,
+            pen=pg.mkPen('#e41a1c', width=2, style=Qt.DashLine),
+            label='Start Core',
+            labelOpts={'position': 0.9, 'color': '#e41a1c'},
+        )
+        self._start_core_line.sigPositionChangeFinished.connect(
+            self._on_start_core_moved
+        )
+        self.plot_widget.addItem(self._start_core_line)
+
+    def remove_start_core_line(self):
+        if self._start_core_line is not None:
+            try:
+                self._start_core_line.sigPositionChangeFinished.disconnect(
+                    self._on_start_core_moved
+                )
+            except Exception:
+                pass
+            try:
+                self.plot_widget.removeItem(self._start_core_line)
+            except Exception:
+                pass
+            self._start_core_line = None
+
+    def _on_start_core_moved(self):
+        if self._start_core_line is None or self._sensor_data is None:
+            return
+        x_pos = self._start_core_line.value()
+        if self._use_datetime_axis:
+            timestamps = self._sensor_data.get_timestamps_epoch()
+            idx = int(np.argmin(np.abs(timestamps - x_pos)))
+        else:
+            idx = max(0, min(int(round(x_pos)), len(self._sensor_data.df) - 1))
+        self.start_core_changed.emit(idx)
 
     # ------------------------------------------------------------------
     # Selection mode
@@ -289,10 +346,8 @@ class SensorPlotView(QWidget):
     # ------------------------------------------------------------------
 
     def _clear_plot(self):
-        # Temporarily block signals/painting during rebuild
         self.plot_widget.setUpdatesEnabled(False)
         try:
-            # Remove selection region before clear to avoid stale paint
             if self._selection_region is not None:
                 try:
                     self.plot_widget.removeItem(self._selection_region)
@@ -302,7 +357,6 @@ class SensorPlotView(QWidget):
 
             self.plot_widget.clear()
             self.plot_widget.addLegend()
-            # Re-create crosshair lines (fresh items avoid stale scene refs)
             self._vline = pg.InfiniteLine(
                 angle=90, movable=False,
                 pen=pg.mkPen('r', width=1, style=Qt.DashLine),
@@ -324,8 +378,6 @@ class SensorPlotView(QWidget):
             self._y_inverted = should_invert
 
     def _draw_selection(self):
-        """Draw selection region if one exists."""
-        # Remove old region
         if self._selection_region is not None:
             try:
                 self.plot_widget.removeItem(self._selection_region)
@@ -338,14 +390,12 @@ class SensorPlotView(QWidget):
         if self._sensor_data is None:
             return
 
-        # Bounds check against current data
         max_idx = len(self._sensor_data.df) - 1
         start_idx = min(self._selection_start_idx, max_idx)
         end_idx = min(self._selection_end_idx, max_idx)
         if start_idx < 0 or end_idx < 0 or start_idx >= end_idx:
             return
 
-        # Build x-coordinates for region
         if self._use_datetime_axis:
             timestamps = self._sensor_data.get_timestamps_epoch()
             start_x = float(timestamps[start_idx])
@@ -382,7 +432,6 @@ class SensorPlotView(QWidget):
         self._vline.setVisible(True)
         self._hline.setVisible(True)
 
-        # Find nearest data point
         if self._use_datetime_axis:
             timestamps = self._sensor_data.get_timestamps_epoch()
             idx = int(np.argmin(np.abs(timestamps - x_pos)))
@@ -394,12 +443,12 @@ class SensorPlotView(QWidget):
             time_str = actual_time.strftime('%Y-%m-%d %H:%M:%S') if pd.notna(actual_time) else 'N/A'
             info_text = f"Index: {idx}  |  Time: {time_str}  |  "
 
-            for label in self._sensor_data.sensor_labels:
-                col = f'Sensor_{label}_Depth'
+            for col in self._sensor_data.depth_columns:
                 if col in self._sensor_data.df.columns:
                     val = self._sensor_data.df[col].iloc[idx]
                     if pd.notna(val):
-                        info_text += f"Sensor {label}: {val:.3f}m  "
+                        loc_name = SensorData.get_location_name(col)
+                        info_text += f"{loc_name}: {val:.3f}m  "
 
             self.info_label.setText(info_text)
 

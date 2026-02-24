@@ -15,9 +15,8 @@ class StatisticsResult:
     range_description: str
     n_points: int
     mean_depth_all_sensors: float
-    sensor_means: dict[str, float] = field(default_factory=dict)
+    column_means: dict[str, float] = field(default_factory=dict)
     difference_means: dict[tuple[str, str], float] = field(default_factory=dict)
-    sensor_identifiers: dict[str, str] = field(default_factory=dict)
     source_file: str = ''
 
     def to_flat_dict(self) -> dict:
@@ -30,12 +29,9 @@ class StatisticsResult:
         for (j, i), val in self.difference_means.items():
             d[f'{j}_minus_{i}_mean'] = val
         d['mean_depth_all_sensors'] = self.mean_depth_all_sensors
-        # Sensor means
-        for label, val in self.sensor_means.items():
-            d[f'Sensor_{label}_mean'] = val
-        # Sensor identifiers
-        for label, ident in self.sensor_identifiers.items():
-            d[f'Sensor_{label}'] = ident
+        # Column means
+        for col, val in self.column_means.items():
+            d[f'{col}_mean'] = val
         d['source_file'] = self.source_file
         return d
 
@@ -43,12 +39,12 @@ class StatisticsResult:
 @dataclass
 class TimeOffsetResult:
     """Result of time offset calculation for one sensor."""
-    sensor_label: str
+    sensor_column: str
     offset_seconds: float
     rms_value: float = 0.0
     is_reference: bool = False
 
     def __repr__(self) -> str:
         if self.is_reference:
-            return f"TimeOffset({self.sensor_label}: reference)"
-        return f"TimeOffset({self.sensor_label}: {self.offset_seconds:+.3f}s, RMS={self.rms_value:.6f})"
+            return f"TimeOffset({self.sensor_column}: reference)"
+        return f"TimeOffset({self.sensor_column}: {self.offset_seconds:+.3f}s, RMS={self.rms_value:.6f})"

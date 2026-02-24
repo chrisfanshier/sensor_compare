@@ -1,7 +1,8 @@
 """
 DepthOffsetPanel - Control panel for the "Depth Offset" mode.
 
-Load data, load calibration, assign sensors, apply depth corrections.
+Load data, load calibration, map calibration labels to columns,
+apply depth corrections.
 """
 from __future__ import annotations
 
@@ -15,12 +16,13 @@ from PySide6.QtCore import Signal
 
 from .base_panel import BaseModePanel
 from ..widgets.log_widget import LogWidget
+from ...domain.models.sensor_data import SensorData
 
 
 class DepthOffsetPanel(BaseModePanel):
     """
     Panel for the Depth Offset mode.
-    
+
     Signals:
         load_file_requested(str): User selected a CSV file.
         load_calibration_requested(str): User selected a JSON calibration file.
@@ -30,14 +32,12 @@ class DepthOffsetPanel(BaseModePanel):
         plot_original_requested: User clicked "Plot Original".
     """
 
-    # Signals
     load_file_requested = Signal(str)
     load_calibration_requested = Signal(str)
     apply_corrections_requested = Signal()
     reset_requested = Signal()
     export_requested = Signal()
     plot_original_requested = Signal()
-    sensor_assignments_changed = Signal()  # User changed a sensor assignment dropdown
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -74,12 +74,13 @@ class DepthOffsetPanel(BaseModePanel):
         calib_group.setLayout(calib_layout)
         self._layout.addWidget(calib_group)
 
-        # -- Sensor Assignments --
-        self.assignment_group = QGroupBox("Sensor Assignments")
-        self.assignment_layout = QGridLayout()
-        self.assignment_combos: list[QComboBox] = []
-        self.assignment_group.setLayout(self.assignment_layout)
-        self._layout.addWidget(self.assignment_group)
+        # -- Calibration Mapping --
+        # Maps each calibration label (A, B, C) to a real depth column
+        self.mapping_group = QGroupBox("Calibration Label Mapping")
+        self.mapping_layout = QGridLayout()
+        self.mapping_combos: dict[str, QComboBox] = {}  # cal_label -> combo
+        self.mapping_group.setLayout(self.mapping_layout)
+        self._layout.addWidget(self.mapping_group)
 
         # -- Reference Sensor --
         ref_group = QGroupBox("Reference Sensor")
@@ -87,7 +88,7 @@ class DepthOffsetPanel(BaseModePanel):
         ref_row = QHBoxLayout()
         ref_row.addWidget(QLabel("Reference:"))
         self.ref_sensor_combo = QComboBox()
-        self.ref_sensor_combo.addItems(['A', 'B', 'C'])
+        # Populated dynamically from calibration labels
         ref_row.addWidget(self.ref_sensor_combo)
         ref_row.addStretch()
         ref_layout.addLayout(ref_row)
@@ -109,21 +110,12 @@ class DepthOffsetPanel(BaseModePanel):
         self._layout.addWidget(self.correction_plan_group)
 
         # -- Manual Offset Corrections --
-        manual_group = QGroupBox("Manual Depth Corrections")
-        manual_layout = QGridLayout()
+        self.manual_group = QGroupBox("Manual Depth Corrections")
+        self.manual_layout = QGridLayout()
         self.manual_offset_spinboxes: dict[str, QDoubleSpinBox] = {}
-        for i, label in enumerate(['A', 'B', 'C']):
-            manual_layout.addWidget(QLabel(f"Sensor {label}:"), i, 0)
-            spinbox = QDoubleSpinBox()
-            spinbox.setRange(-1000, 1000)
-            spinbox.setSingleStep(0.01)
-            spinbox.setDecimals(4)
-            spinbox.setValue(0.0)
-            manual_layout.addWidget(spinbox, i, 1)
-            manual_layout.addWidget(QLabel("m"), i, 2)
-            self.manual_offset_spinboxes[label] = spinbox
-        manual_group.setLayout(manual_layout)
-        self._layout.addWidget(manual_group)
+        # Populated dynamically when data is loaded
+        self.manual_group.setLayout(self.manual_layout)
+        self._layout.addWidget(self.manual_group)
 
         # -- Actions --
         action_group = QGroupBox("Actions")
@@ -155,7 +147,7 @@ class DepthOffsetPanel(BaseModePanel):
         self._finish_layout()
 
     # ------------------------------------------------------------------
-    # Public helpers for controller to populate UI
+    # Public helpers for controller
     # ------------------------------------------------------------------
 
     def update_file_info(self, filename: str, sensors: int, rows: int, core_title: str = ''):
@@ -169,55 +161,76 @@ class DepthOffsetPanel(BaseModePanel):
         for line in info_lines:
             self.log_widget.log(line)
 
-    def setup_sensor_assignments(self, original_columns: list[str],
-                                 current_assignments: dict[str, str]):
-        """
-        Populate the sensor assignment dropdowns.
-
-        Args:
-            original_columns: Original CSV depth column names
-                              (e.g., 'Weight Stand_230406..._Depth (m)').
-            current_assignments: Maps original_column_name -> sensor label.
-        """
+    def setup_manual_offsets(self, depth_columns: list[str]):
+        """Build manual offset spinboxes for each depth column."""
         # Clear previous
-        while self.assignment_layout.count():
-            item = self.assignment_layout.takeAt(0)
+        while self.manual_layout.count():
+            item = self.manual_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
-        self.assignment_combos = []
+        self.manual_offset_spinboxes = {}
 
-        self.assignment_layout.addWidget(QLabel("Column"), 0, 0)
-        self.assignment_layout.addWidget(QLabel("Assign to"), 0, 1)
+        for i, col in enumerate(depth_columns):
+            short = SensorData.get_short_name(col)
+            self.manual_layout.addWidget(QLabel(f"{short}:"), i, 0)
+            spinbox = QDoubleSpinBox()
+            spinbox.setRange(-1000, 1000)
+            spinbox.setSingleStep(0.01)
+            spinbox.setDecimals(4)
+            spinbox.setValue(0.0)
+            spinbox.setToolTip(col)
+            self.manual_layout.addWidget(spinbox, i, 1)
+            self.manual_layout.addWidget(QLabel("m"), i, 2)
+            self.manual_offset_spinboxes[col] = spinbox
 
-        sensor_options = ['None', 'A', 'B', 'C']
-        for i, orig_col in enumerate(original_columns):
+    def setup_calibration_mapping(self, cal_labels: list[str], depth_columns: list[str]):
+        """Set up mapping combos: calibration label -> depth column.
+
+        Args:
+            cal_labels: Labels from the calibration file (e.g. ['A', 'B', 'C']).
+            depth_columns: Real depth column names from the loaded data.
+        """
+        # Clear previous
+        while self.mapping_layout.count():
+            item = self.mapping_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.mapping_combos.clear()
+
+        self.mapping_layout.addWidget(QLabel("Cal. Label"), 0, 0)
+        self.mapping_layout.addWidget(QLabel("Depth Column"), 0, 1)
+
+        # Build ref sensor combo from calibration labels
+        self.ref_sensor_combo.clear()
+        self.ref_sensor_combo.addItems(cal_labels)
+
+        short_names = [SensorData.get_short_name(c) for c in depth_columns]
+
+        for i, cal_label in enumerate(cal_labels):
             row = i + 1
-            # Extract location + serial for disambiguation
-            parts = orig_col.split('_')
-            location = parts[0]
-            if len(parts) > 1:
-                serial = parts[1].removesuffix('.rsk')
-                short_name = f"{location} ({serial})"
-            else:
-                short_name = location
-            label = QLabel(short_name)
-            label.setToolTip(orig_col)
-            self.assignment_layout.addWidget(label, row, 0)
-
+            self.mapping_layout.addWidget(QLabel(f"Sensor {cal_label}:"), row, 0)
             combo = QComboBox()
-            combo.addItems(sensor_options)
-            assigned = current_assignments.get(orig_col, 'None')
-            combo.setCurrentText(assigned)
-            combo.currentTextChanged.connect(
-                lambda text, c=orig_col: self._on_assignment_changed(c, text)
-            )
-            self.assignment_layout.addWidget(combo, row, 1)
-            self.assignment_combos.append((orig_col, combo))
+            combo.addItem("(unmapped)", "")
+            for j, col in enumerate(depth_columns):
+                combo.addItem(short_names[j], col)
+                combo.setItemData(combo.count() - 1, col)
 
-    def _on_assignment_changed(self, column: str, sensor: str):
-        """User changed a sensor assignment dropdown."""
-        self.sensor_assignments_changed.emit()
+            # Auto-select by position if possible
+            if i < len(depth_columns):
+                combo.setCurrentIndex(i + 1)  # +1 for "(unmapped)"
+
+            self.mapping_layout.addWidget(combo, row, 1)
+            self.mapping_combos[cal_label] = combo
+
+    def get_calibration_mapping(self) -> dict[str, str]:
+        """Return mapping: calibration_label -> depth_column_name."""
+        result = {}
+        for cal_label, combo in self.mapping_combos.items():
+            col = combo.currentData()
+            if col:
+                result[cal_label] = col
+        return result
 
     def update_correction_plan(self, applicable: list[dict]):
         """Update the correction plan checkboxes."""
@@ -254,7 +267,7 @@ class DepthOffsetPanel(BaseModePanel):
                 f"Regression: {reg.sensor_j} - {reg.sensor_i}\n"
                 f"Slope: {reg.slope:.6f}\n"
                 f"Intercept: {reg.intercept:.6f}\n"
-                f"R²: {reg.r_squared:.4f}"
+                f"R\u00b2: {reg.r_squared:.4f}"
             )
             self.correction_checkboxes[item['target']] = {
                 'checkbox': checkbox,
@@ -263,25 +276,20 @@ class DepthOffsetPanel(BaseModePanel):
             }
             self.correction_plan_layout.addWidget(checkbox)
 
-    def get_sensor_assignments(self) -> dict[str, str]:
-        """Return current sensor assignments: original_column_name -> sensor_label."""
-        result = {}
-        for orig_col, combo in self.assignment_combos:
-            text = combo.currentText()
-            if text != 'None':
-                result[orig_col] = text
-        return result
-
     def get_manual_offsets(self) -> dict[str, float]:
-        """Return manual offsets: sensor_label -> offset_meters."""
-        return {label: spin.value() for label, spin in self.manual_offset_spinboxes.items()}
+        """Return manual offsets: depth_column -> offset_meters."""
+        return {col: spin.value() for col, spin in self.manual_offset_spinboxes.items()}
 
     def get_enabled_calibration_targets(self) -> list[str]:
-        """Return list of sensor labels whose calibration checkbox is checked."""
+        """Return list of calibration labels whose checkbox is checked."""
         return [
             label for label, info in self.correction_checkboxes.items()
             if info['checkbox'].isChecked()
         ]
+
+    def get_ref_sensor(self) -> str:
+        """Return the selected reference calibration label."""
+        return self.ref_sensor_combo.currentText()
 
     # ------------------------------------------------------------------
     # Private

@@ -35,9 +35,11 @@ from ..gui.panels.depth_offset_panel import DepthOffsetPanel
 from ..gui.panels.time_offset_panel import TimeOffsetPanel
 from ..gui.panels.create_calibration_panel import CreateCalibrationPanel
 from ..gui.panels.trip_detector_panel import TripDetectorPanel
+from ..gui.panels.piston_position_panel import PistonPositionPanel
 from ..controllers.analysis_controller import AnalysisController
 
-MODES = ['View Data', 'Depth Offset', 'Time Offset', 'Create Calibration', 'Trip Detector']
+MODES = ['View Data', 'Depth Offset', 'Time Offset', 'Create Calibration',
+         'Trip Detector', 'Piston Position']
 
 
 class MainWindow(QMainWindow):
@@ -101,12 +103,14 @@ class MainWindow(QMainWindow):
         self.time_panel = TimeOffsetPanel()
         self.calibration_panel = CreateCalibrationPanel()
         self.trip_panel = TripDetectorPanel()
+        self.piston_panel = PistonPositionPanel()
 
         self.panel_stack.addWidget(self.view_panel)      # 0
         self.panel_stack.addWidget(self.depth_panel)      # 1
         self.panel_stack.addWidget(self.time_panel)       # 2
         self.panel_stack.addWidget(self.calibration_panel) # 3
         self.panel_stack.addWidget(self.trip_panel)       # 4
+        self.panel_stack.addWidget(self.piston_panel)     # 5
 
         self.panel_stack.setMinimumWidth(400)
         self.panel_stack.setMaximumWidth(550)
@@ -151,6 +155,7 @@ class MainWindow(QMainWindow):
         self.controller.time_panel = self.time_panel
         self.controller.calibration_panel = self.calibration_panel
         self.controller.trip_panel = self.trip_panel
+        self.controller.piston_panel = self.piston_panel
 
     def _build_status_bar(self):
         self.statusBar().showMessage("Ready")

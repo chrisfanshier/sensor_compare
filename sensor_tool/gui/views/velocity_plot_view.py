@@ -27,7 +27,7 @@ class HeavePlotView(QWidget):
 
     Two display modes:
     - Uncorrected: ref heave + mov heave (original) for selected range.
-    - Corrected: ref heave + mov heave (shifted) overlaid for visual verification.
+    - Corrected: ref heave + mov heave (shifted) overlaid.
     """
 
     def __init__(self, parent=None):
@@ -38,14 +38,12 @@ class HeavePlotView(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # Info label
         self.info_label = QLabel('')
         self.info_label.setStyleSheet(
             'QLabel { background-color: white; padding: 5px; border: 1px solid gray; }'
         )
         layout.addWidget(self.info_label)
 
-        # Plot
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setBackground('w')
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
@@ -53,7 +51,6 @@ class HeavePlotView(QWidget):
         self.plot_widget.setLabel('left', 'Heave (m)')
         self.plot_widget.setLabel('bottom', 'Sample')
 
-        # Crosshairs
         self._vline = pg.InfiniteLine(
             angle=90, movable=False,
             pen=pg.mkPen('r', width=1, style=Qt.DashLine)
@@ -69,7 +66,6 @@ class HeavePlotView(QWidget):
 
         layout.addWidget(self.plot_widget)
 
-        # Mouse tracking
         self._mouse_proxy = pg.SignalProxy(
             self.plot_widget.scene().sigMouseMoved,
             rateLimit=60,
@@ -85,17 +81,16 @@ class HeavePlotView(QWidget):
     def plot_heave_uncorrected(
         self,
         heaves: dict[str, np.ndarray],
-        ref_sensor: str,
+        ref_col: str,
         time_axis: np.ndarray | None = None,
     ):
         """
         Plot uncorrected heave profiles for the selected range.
 
         Args:
-            heaves: Dict mapping sensor_label -> heave array.
-            ref_sensor: Reference sensor label.
-            time_axis: Optional x-axis values (e.g. relative seconds).
-                       If None, uses sample index.
+            heaves: Dict mapping depth_column -> heave array.
+            ref_col: Reference depth column name.
+            time_axis: Optional x-axis values.
         """
         self._clear_plot()
 
@@ -108,19 +103,20 @@ class HeavePlotView(QWidget):
             self.plot_widget.setLabel('bottom', 'Sample')
         self._x_axis = x
 
-        self.plot_widget.setTitle('Isolated Heave — Uncorrected')
+        self.plot_widget.setTitle('Isolated Heave \u2014 Uncorrected')
 
         color_idx = 0
-        for label, heave in heaves.items():
-            if label == ref_sensor:
+        for col, heave in heaves.items():
+            short = SensorData.get_short_name(col)
+            if col == ref_col:
                 pen = pg.mkPen(color=REF_COLOR, width=2)
-                name = f'Ref ({label})'
+                name = f'Ref ({short})'
             else:
                 pen = pg.mkPen(
                     color=SENSOR_COLORS[color_idx % len(SENSOR_COLORS)],
                     width=2, style=Qt.DashLine,
                 )
-                name = f'Sensor {label} (original)'
+                name = f'{short} (original)'
                 color_idx += 1
 
             plot_x = x[:len(heave)] if len(heave) <= len(x) else x
@@ -129,7 +125,6 @@ class HeavePlotView(QWidget):
                 connect='finite', skipFiniteCheck=True,
             )
 
-        # Zero line
         if len(x) > 0:
             pen_zero = pg.mkPen('k', width=1, style=Qt.DashLine)
             self.plot_widget.plot(
@@ -142,7 +137,7 @@ class HeavePlotView(QWidget):
         self,
         heaves_original: dict[str, np.ndarray],
         heaves_corrected: dict[str, np.ndarray],
-        ref_sensor: str,
+        ref_col: str,
         offsets: dict[str, float],
         time_axis: np.ndarray | None = None,
     ):
@@ -150,10 +145,10 @@ class HeavePlotView(QWidget):
         Plot corrected/aligned heave profiles overlaying the reference.
 
         Args:
-            heaves_original: Uncorrected heave profiles.
-            heaves_corrected: Corrected (time-shifted) heave profiles.
-            ref_sensor: Reference sensor label.
-            offsets: Dict mapping sensor_label -> offset_seconds.
+            heaves_original: Uncorrected heave profiles (depth_col -> array).
+            heaves_corrected: Corrected heave profiles (depth_col -> array).
+            ref_col: Reference depth column name.
+            offsets: Dict mapping depth_col -> offset_seconds.
             time_axis: Optional x-axis values.
         """
         self._clear_plot()
@@ -167,36 +162,36 @@ class HeavePlotView(QWidget):
             self.plot_widget.setLabel('bottom', 'Sample')
         self._x_axis = x
 
-        self.plot_widget.setTitle('Isolated Heave — Corrected / Aligned')
+        self.plot_widget.setTitle('Isolated Heave \u2014 Corrected / Aligned')
 
         # Plot reference heave
-        if ref_sensor in heaves_original:
-            ref_h = heaves_original[ref_sensor]
+        if ref_col in heaves_original:
+            ref_h = heaves_original[ref_col]
             plot_x = x[:len(ref_h)]
             pen = pg.mkPen(color=REF_COLOR, width=2)
+            short = SensorData.get_short_name(ref_col)
             self.plot_widget.plot(
                 plot_x, ref_h[:len(plot_x)], pen=pen,
-                name=f'Ref ({ref_sensor})',
+                name=f'Ref ({short})',
                 connect='finite', skipFiniteCheck=True,
             )
 
-        # Plot corrected heave for each non-ref sensor
         color_idx = 0
-        for label, heave in heaves_corrected.items():
-            if label == ref_sensor:
+        for col, heave in heaves_corrected.items():
+            if col == ref_col:
                 continue
-            offset_str = f"{offsets.get(label, 0):+.4f}s"
+            short = SensorData.get_short_name(col)
+            offset_str = f"{offsets.get(col, 0):+.4f}s"
             pen = pg.mkPen(color=CORRECTED_COLOR, width=2)
             plot_x = x[:len(heave)]
             self.plot_widget.plot(
                 plot_x, heave[:len(plot_x)], pen=pen,
-                name=f'Sensor {label} (aligned {offset_str})',
+                name=f'{short} (aligned {offset_str})',
                 connect='finite', skipFiniteCheck=True,
             )
 
-            # Also plot original as faded dashed for comparison
-            if label in heaves_original:
-                orig_h = heaves_original[label]
+            if col in heaves_original:
+                orig_h = heaves_original[col]
                 pen_orig = pg.mkPen(
                     color=SENSOR_COLORS[color_idx % len(SENSOR_COLORS)],
                     width=1, style=Qt.DotLine,
@@ -204,12 +199,11 @@ class HeavePlotView(QWidget):
                 plot_x2 = x[:len(orig_h)]
                 self.plot_widget.plot(
                     plot_x2, orig_h[:len(plot_x2)], pen=pen_orig,
-                    name=f'Sensor {label} (original)',
+                    name=f'{short} (original)',
                     connect='finite', skipFiniteCheck=True,
                 )
             color_idx += 1
 
-        # Zero line
         if len(x) > 0:
             pen_zero = pg.mkPen('k', width=1, style=Qt.DashLine)
             self.plot_widget.plot(

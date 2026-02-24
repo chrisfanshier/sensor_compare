@@ -21,7 +21,7 @@ from ..widgets.selection_controls import SelectionControls
 class CreateCalibrationPanel(BaseModePanel):
     """
     Panel for the Create Calibration mode.
-    
+
     Signals:
         load_cast_requested(str): User selected a CSV file to load as a cast.
         add_statistics_requested: Add stats from current selection.
@@ -93,12 +93,11 @@ class CreateCalibrationPanel(BaseModePanel):
         self.datetime_col_edit = QLineEdit("datetime")
         sensor_layout.addWidget(self.datetime_col_edit, 1, 1)
 
-        # Sensor pattern fields
+        # Sensor pattern fields (serial numbers to match columns)
         self.sensor_entries: list[QLineEdit] = []
         default_sensors = ["230405", "230406", "236222", "236223"]
-        self.sensor_labels_list = ['A', 'B', 'C', 'D']
         for i in range(4):
-            label = QLabel(f"Sensor {self.sensor_labels_list[i]}:")
+            label = QLabel(f"Pattern {i+1}:")
             sensor_layout.addWidget(label, 2 + i, 0)
             entry = QLineEdit(default_sensors[i])
             sensor_layout.addWidget(entry, 2 + i, 1)

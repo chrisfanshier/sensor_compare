@@ -14,13 +14,14 @@ from PySide6.QtCore import Signal
 from .base_panel import BaseModePanel
 from ..widgets.log_widget import LogWidget
 from ..widgets.selection_controls import SelectionControls
+from ...domain.models.sensor_data import SensorData
 from ...domain.models.analysis_result import TimeOffsetResult
 
 
 class TimeOffsetPanel(BaseModePanel):
     """
     Panel for the Time Offset mode.
-    
+
     Signals:
         load_file_requested(str): User selected a CSV file.
         calculate_offsets_requested: User clicked "Calculate Offsets".
@@ -84,7 +85,7 @@ class TimeOffsetPanel(BaseModePanel):
         self.filter_order_spin = QSpinBox()
         self.filter_order_spin.setRange(1, 10)
         self.filter_order_spin.setValue(4)
-        self.filter_order_spin.setToolTip("Butterworth filter order (higher = steeper rolloff).")
+        self.filter_order_spin.setToolTip("Butterworth filter order.")
         filter_layout.addWidget(self.filter_order_spin, 2, 1)
 
         filter_group.setLayout(filter_layout)
@@ -96,7 +97,7 @@ class TimeOffsetPanel(BaseModePanel):
         ref_row = QHBoxLayout()
         ref_row.addWidget(QLabel("Reference:"))
         self.ref_sensor_combo = QComboBox()
-        self.ref_sensor_combo.addItems(['A', 'B', 'C'])
+        # Populated dynamically when data is loaded
         ref_row.addWidget(self.ref_sensor_combo)
         ref_row.addStretch()
         ref_layout.addLayout(ref_row)
@@ -167,29 +168,37 @@ class TimeOffsetPanel(BaseModePanel):
     def update_file_info(self, filename: str, sensors: int, rows: int):
         self.file_label.setText(f"File: {filename}\nSensors: {sensors}  |  Rows: {rows:,}")
 
+    def populate_ref_sensor_combo(self, depth_columns: list[str]):
+        """Populate the reference sensor dropdown with real column short names."""
+        self.ref_sensor_combo.clear()
+        for col in depth_columns:
+            short = SensorData.get_short_name(col)
+            self.ref_sensor_combo.addItem(short, userData=col)
+
+    def get_ref_col(self) -> str | None:
+        """Return the depth column name selected as reference."""
+        return self.ref_sensor_combo.currentData()
+
     def display_offsets(self, results: list[TimeOffsetResult]):
         """Update the offset display with calculation results."""
         self.offset_text.clear()
         self.offset_text.append("Calculated Time Offsets:")
         self.offset_text.append("=" * 40)
         for r in results:
+            short = SensorData.get_short_name(r.sensor_column)
             if r.is_reference:
-                self.offset_text.append(f"Sensor {r.sensor_label}: 0.000s (reference)")
+                self.offset_text.append(f"{short}: 0.000s (reference)")
             else:
                 self.offset_text.append(
-                    f"Sensor {r.sensor_label}: {r.offset_seconds:+.3f}s  (RMS: {r.rms_value:.6f})"
+                    f"{short}: {r.offset_seconds:+.3f}s  (RMS: {r.rms_value:.6f})"
                 )
 
     def get_filter_params(self) -> tuple[float, float, int]:
-        """Return (low_freq, high_freq, filter_order)."""
         return (
             self.low_freq_spin.value(),
             self.high_freq_spin.value(),
             self.filter_order_spin.value(),
         )
-
-    def get_ref_sensor(self) -> str:
-        return self.ref_sensor_combo.currentText()
 
     # ------------------------------------------------------------------
     # Private

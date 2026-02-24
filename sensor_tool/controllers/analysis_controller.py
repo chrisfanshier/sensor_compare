@@ -4,6 +4,9 @@ AnalysisController - Central coordinator for the application.
 Manages mode switching, data flow between panels/views, and calls
 into domain processing logic. This keeps the GUI panels thin and
 the business logic testable.
+
+All depth columns keep their ORIGINAL CSV names throughout -- no
+A/B/C/D aliasing ever occurs in this layer.
 """
 from __future__ import annotations
 
@@ -16,7 +19,7 @@ from scipy import stats as sp_stats
 
 from PySide6.QtWidgets import QFileDialog, QMessageBox
 
-from ..domain.models.sensor_data import SensorData, CorrectionRecord, SENSOR_LABELS
+from ..domain.models.sensor_data import SensorData, CorrectionRecord
 from ..domain.models.calibration import DepthCalibration
 from ..domain.models.analysis_result import StatisticsResult, TimeOffsetResult
 from ..domain.processing.depth_correction import DepthCorrectionProcessor
@@ -24,6 +27,9 @@ from ..domain.processing.time_correction import TimeCorrectionProcessor
 from ..domain.processing.trip_detection import TripDetectionProcessor
 from ..domain.processing.calibration_builder import CalibrationBuilder
 from ..domain.processing.statistics import compute_statistics
+from ..domain.processing.piston_position import (
+    compute_piston_position, detect_start_core,
+)
 from ..persistence.csv_loader import CSVLoader
 from ..persistence.calibration_io import CalibrationIO
 
@@ -31,7 +37,7 @@ from ..persistence.calibration_io import CalibrationIO
 class AnalysisController:
     """
     Coordinates all application logic.
-    
+
     Holds references to GUI panels and views, connects signals,
     and delegates to domain processing.
     """
@@ -40,7 +46,6 @@ class AnalysisController:
         # State
         self.sensor_data: Optional[SensorData] = None      # Primary data
         self.original_data: Optional[SensorData] = None     # Backup for reset
-        self._raw_loaded_data: Optional[SensorData] = None  # Pristine copy for reassignment
         self._loaded_file_path: Optional[str] = None        # Full path to loaded file
         self.calibration: Optional[DepthCalibration] = None
         self.generated_calibration: Optional[DepthCalibration] = None
@@ -51,6 +56,7 @@ class AnalysisController:
         self._heave_fs: Optional[float] = None
         self._heave_sel: Optional[tuple[int, int]] = None
         self.collected_statistics: list[StatisticsResult] = []
+        self._piston_start_core_idx: Optional[int] = None
 
         # GUI references (set by main_window after construction)
         self.main_window = None
@@ -66,6 +72,7 @@ class AnalysisController:
         self.time_panel = None
         self.calibration_panel = None
         self.trip_panel = None
+        self.piston_panel = None
 
     # ==================================================================
     # Initialization - called by MainWindow
@@ -83,9 +90,6 @@ class AnalysisController:
         self.depth_panel.load_calibration_requested.connect(self.load_calibration)
         self.depth_panel.ref_sensor_combo.currentTextChanged.connect(
             self._update_depth_correction_plan
-        )
-        self.depth_panel.sensor_assignments_changed.connect(
-            self._on_sensor_assignments_changed
         )
         self.depth_panel.apply_corrections_requested.connect(self.apply_depth_corrections)
         self.depth_panel.reset_requested.connect(self.reset_to_original)
@@ -125,6 +129,14 @@ class AnalysisController:
         self.trip_panel.plot_original_requested.connect(self.plot_depths)
         self.trip_panel.export_requested.connect(self.export_trip_csv)
 
+        # Piston Position panel
+        self.piston_panel.load_file_requested.connect(self.load_export_csv)
+        self.piston_panel.calculate_requested.connect(self.calculate_piston)
+        self.piston_panel.plot_original_requested.connect(self.plot_depths)
+
+        # Main plot start_core drag signal
+        self.main_plot.start_core_changed.connect(self._on_start_core_moved)
+
     # ==================================================================
     # Data Loading
     # ==================================================================
@@ -137,9 +149,6 @@ class AnalysisController:
 
             self.sensor_data = CSVLoader.load_export_csv(file_path)
             self.original_data = self.sensor_data.copy()
-            # Also keep a pristine copy for reassignment (before any remap)
-            self._raw_loaded_data = self.sensor_data.copy()
-            # Store full path for later export
             self._loaded_file_path = file_path
             self._update_all_panels_file_info()
             self.main_plot.set_sensor_data(self.sensor_data)
@@ -154,7 +163,7 @@ class AnalysisController:
             self._log_active(f"ERROR: {e}")
 
     def load_calibration(self, file_path: str):
-        """Load a JSON calibration file."""
+        """Load a JSON calibration file and set up mapping UI."""
         try:
             self.calibration = CalibrationIO.load(file_path)
             filename = Path(file_path).name
@@ -164,10 +173,18 @@ class AnalysisController:
                 info_lines.append(
                     f"  {reg.sensor_j} - {reg.sensor_i}: "
                     f"slope={reg.slope:.6f}, intercept={reg.intercept:.6f}, "
-                    f"R²={reg.r_squared:.4f}"
+                    f"R\u00b2={reg.r_squared:.4f}"
                 )
 
             self.depth_panel.update_calibration_info(filename, info_lines)
+
+            # Set up calibration label -> column mapping UI
+            cal_labels = self.calibration.sensor_labels
+            if self.sensor_data is not None:
+                self.depth_panel.setup_calibration_mapping(
+                    cal_labels, self.sensor_data.depth_columns,
+                )
+
             self._update_depth_correction_plan()
             self._log_active(f"Calibration loaded: {filename}")
         except Exception as e:
@@ -197,55 +214,12 @@ class AnalysisController:
     # Depth Offset Mode
     # ==================================================================
 
-    def _on_sensor_assignments_changed(self):
-        """
-        User changed the sensor assignment dropdowns.
-        Remap the sensor data columns to match the new assignment.
-        """
-        if self._raw_loaded_data is None:
-            return
-
-        assignments = self.depth_panel.get_sensor_assignments()
-        if not assignments:
-            return
-
-        try:
-            remapped = self._raw_loaded_data.remap_sensor_labels(assignments)
-        except ValueError:
-            # Normal transitional state: user is mid-edit with duplicate labels.
-            # Wait for them to finish reassigning.
-            return
-
-        try:
-            self.sensor_data = remapped
-            self.original_data = remapped.copy()
-            self.main_plot.set_sensor_data(self.sensor_data)
-            self.plot_depths()
-
-            panel = self.depth_panel
-            panel.log_widget.log("Sensor assignments updated:")
-            for orig_col, label in assignments.items():
-                parts = orig_col.split('_')
-                short = parts[0]
-                if len(parts) > 1:
-                    short = f"{short} ({parts[1].removesuffix('.rsk')})"
-                panel.log_widget.log(f"  {short} → Sensor {label}")
-
-            # Refresh correction plan if calibration loaded
-            self._update_depth_correction_plan()
-
-        except Exception as e:
-            self.depth_panel.log_widget.log(f"ERROR remapping: {e}")
-
     def apply_depth_corrections(self):
         """
         Apply depth calibration and manual offsets.
 
-        Mirrors the working sensor_compare_time_pyside6.py approach:
-        - Uses sensor assignments to find reference and target columns
-        - Applies depth-dependent regression corrections
-        - Applies manual constant offsets
-        - Operates on the ORIGINAL column data via assignment mapping
+        Uses the calibration label -> column mapping from the depth panel
+        and delegates to the DepthCorrectionProcessor.
         """
         if self.sensor_data is None:
             self._show_warning("No data loaded")
@@ -254,109 +228,74 @@ class AnalysisController:
         try:
             # Work on a copy from original
             working = self.original_data.copy()
-            ref_sensor = self.depth_panel.ref_sensor_combo.currentText()
             panel = self.depth_panel
-            assignments = panel.get_sensor_assignments()
 
             panel.log_widget.log(f"\n{'='*50}")
-            panel.log_widget.log(f"APPLYING CORRECTIONS")
-            panel.log_widget.log(f"Reference: Sensor {ref_sensor} (will NOT be modified)")
-            panel.log_widget.log(f"{'='*50}")
+            panel.log_widget.log("APPLYING CORRECTIONS")
 
-            # Find the reference column (the renamed Sensor_{ref}_Depth)
-            ref_col = f'Sensor_{ref_sensor}_Depth'
-            if ref_col not in working.df.columns:
+            # Get calibration mapping and reference
+            cal_mapping = panel.get_calibration_mapping()  # cal_label -> col_name
+            ref_label = panel.get_ref_sensor()             # calibration label
+
+            # Find corresponding column for reference
+            ref_col = cal_mapping.get(ref_label)
+            if ref_col is None:
                 self._show_warning(
-                    f"Reference sensor {ref_sensor} not found in data. "
-                    f"Check sensor assignments."
+                    f"Reference sensor '{ref_label}' is not mapped to a column.\n"
+                    f"Check the calibration label mapping."
                 )
                 return
 
-            # Apply regression corrections based on checkboxes
-            if panel.correction_checkboxes:
-                panel.log_widget.log(f"\nApplying depth-dependent corrections...")
+            ref_short = SensorData.get_short_name(ref_col)
+            panel.log_widget.log(
+                f"Reference: {ref_label} = {ref_short} (will NOT be modified)"
+            )
+            panel.log_widget.log(f"{'='*50}")
 
-                for target_sensor, info in panel.correction_checkboxes.items():
-                    if not info['checkbox'].isChecked():
-                        continue
+            # Apply regression corrections if calibration loaded
+            correction_results = {}
+            if self.calibration is not None and panel.correction_checkboxes:
+                enabled_targets = panel.get_enabled_calibration_targets()
 
-                    target_col = f'Sensor_{target_sensor}_Depth'
-                    if target_col not in working.df.columns:
-                        continue
+                panel.log_widget.log("\nApplying depth-dependent corrections...")
+                correction_results = DepthCorrectionProcessor.apply_calibration(
+                    working,
+                    self.calibration,
+                    ref_col,
+                    cal_mapping,
+                    enabled_targets,
+                )
 
-                    reg = info['reg']
-                    sign = info['sign']
-
-                    # Calculate offset at EACH depth point using reference depth
-                    ref_depths = working.df[ref_col].values
-                    offsets = reg.slope * ref_depths + reg.intercept
-                    corrections = sign * offsets
-
-                    # Apply point-by-point correction
-                    original_vals = working.df[target_col].values
-                    working.update_depth_column(target_sensor, original_vals + corrections)
-
-                    # Report statistics
-                    mean_c = float(np.nanmean(corrections))
-                    std_c = float(np.nanstd(corrections))
-                    min_c = float(np.nanmin(corrections))
-                    max_c = float(np.nanmax(corrections))
-
-                    working.add_correction(CorrectionRecord(
-                        correction_type='depth_calibration',
-                        sensor_label=target_sensor,
-                        description=(
-                            f"Regression {reg.sensor_j}-{reg.sensor_i}: "
-                            f"slope={reg.slope:.6f}, intercept={reg.intercept:.6f}"
-                        ),
-                        parameters={
-                            'slope': reg.slope,
-                            'intercept': reg.intercept,
-                            'sign': sign,
-                            'ref_sensor': ref_sensor,
-                        },
-                    ))
-
+                for col, stats in correction_results.items():
+                    short = SensorData.get_short_name(col)
                     panel.log_widget.log(
-                        f"\nSensor {target_sensor}: Applied regression "
-                        f"{reg.sensor_j}-{reg.sensor_i}"
+                        f"\n{short}: correction range "
+                        f"{stats['min']:+.4f}m to {stats['max']:+.4f}m"
                     )
                     panel.log_widget.log(
-                        f"  Correction range: {min_c:+.4f}m to {max_c:+.4f}m"
-                    )
-                    panel.log_widget.log(
-                        f"  Mean: {mean_c:+.4f}m \u00b1 {std_c:.4f}m"
+                        f"  Mean: {stats['mean']:+.4f}m \u00b1 {stats['std']:.4f}m"
                     )
 
             # Apply manual offsets
             manual = panel.get_manual_offsets()
-            manual_applied = False
-            for label, offset in manual.items():
-                if offset == 0.0:
-                    continue
-                col = f'Sensor_{label}_Depth'
-                if col not in working.df.columns:
-                    continue
-                if not manual_applied:
-                    panel.log_widget.log(f"\nManual offsets:")
-                    manual_applied = True
-                working.df[col] = working.df[col] + offset
-                working.add_correction(CorrectionRecord(
-                    correction_type='depth_manual',
-                    sensor_label=label,
-                    description=f"Manual offset: {offset:+.4f}m",
-                    parameters={'offset_m': offset},
-                ))
-                panel.log_widget.log(f"  Sensor {label}: {offset:+.4f}m")
+            applied_manual = DepthCorrectionProcessor.apply_manual_offsets(
+                working, manual,
+            )
+            if applied_manual:
+                panel.log_widget.log("\nManual offsets:")
+                for col, offset in applied_manual.items():
+                    short = SensorData.get_short_name(col)
+                    panel.log_widget.log(f"  {short}: {offset:+.4f}m")
 
             self.sensor_data = working
             self.main_plot.set_sensor_data(self.sensor_data)
 
             # Build label suffixes showing applied corrections
             suffixes = {}
-            for label in working.sensor_labels:
-                short = working.get_original_short_name(label)
-                suffixes[label] = f" ({short} corrected)"
+            for col in working.depth_columns:
+                if col in correction_results or col in applied_manual:
+                    short = SensorData.get_short_name(col)
+                    suffixes[col] = f" ({short} corrected)"
 
             self.main_plot.plot_depths_with_labels(
                 self.sensor_data, suffixes,
@@ -398,13 +337,20 @@ class AnalysisController:
             start_idx, end_idx = sel
             panel = self.time_panel
             low_freq, high_freq, filter_order = panel.get_filter_params()
-            ref_sensor = panel.get_ref_sensor()
+            ref_col = panel.get_ref_col()
 
+            if ref_col is None:
+                self._show_warning("Select a reference sensor")
+                return
+
+            ref_short = SensorData.get_short_name(ref_col)
             panel.log_widget.log(f"\n{'='*50}")
             panel.log_widget.log("CALCULATING TIME OFFSETS (Heave Cross-Correlation)")
             panel.log_widget.log(f"Range: rows {start_idx}-{end_idx}")
-            panel.log_widget.log(f"Bandpass: {low_freq:.3f}-{high_freq:.3f} Hz, order {filter_order}")
-            panel.log_widget.log(f"Reference: Sensor {ref_sensor}")
+            panel.log_widget.log(
+                f"Bandpass: {low_freq:.3f}-{high_freq:.3f} Hz, order {filter_order}"
+            )
+            panel.log_widget.log(f"Reference: {ref_short}")
             panel.log_widget.log(f"{'='*50}")
 
             # Compute heave profiles for visualization
@@ -416,7 +362,9 @@ class AnalysisController:
             self._heave_fs = fs
             self._heave_sel = (start_idx, end_idx)
 
-            panel.log_widget.log(f"Sampling rate: {fs:.2f} Hz ({1/fs:.4f}s interval)")
+            panel.log_widget.log(
+                f"Sampling rate: {fs:.2f} Hz ({1/fs:.4f}s interval)"
+            )
 
             # Build a relative-seconds time axis for the selection
             dt_col = self.sensor_data.datetime_col
@@ -428,15 +376,16 @@ class AnalysisController:
             # Calculate offsets
             self.time_offset_results = TimeCorrectionProcessor.calculate_offsets(
                 self.sensor_data, start_idx, end_idx,
-                ref_sensor, low_freq, high_freq, filter_order,
+                ref_col, low_freq, high_freq, filter_order,
             )
 
             for r in self.time_offset_results:
+                short = SensorData.get_short_name(r.sensor_column)
                 if r.is_reference:
-                    panel.log_widget.log(f"Sensor {r.sensor_label}: 0.0000s (reference)")
+                    panel.log_widget.log(f"{short}: 0.0000s (reference)")
                 else:
                     panel.log_widget.log(
-                        f"Sensor {r.sensor_label}: {r.offset_seconds:+.4f}s "
+                        f"{short}: {r.offset_seconds:+.4f}s "
                         f"(heave RMS: {r.rms_value:.6f}m)"
                     )
 
@@ -445,7 +394,7 @@ class AnalysisController:
             # Show uncorrected heave on secondary plot
             if self.heave_plot is not None:
                 self.heave_plot.plot_heave_uncorrected(
-                    heaves, ref_sensor, time_axis=t_sec,
+                    heaves, ref_col, time_axis=t_sec,
                 )
                 self.main_window.show_secondary_view('heave')
 
@@ -472,13 +421,13 @@ class AnalysisController:
             )
             self.main_plot.set_sensor_data(self.sensor_data)
 
-            # Build label suffixes
+            # Build label suffixes keyed by column name
             suffixes = {}
             for r in self.time_offset_results:
                 if not r.is_reference:
-                    suffixes[r.sensor_label] = f" ({r.offset_seconds:+.4f}s)"
+                    suffixes[r.sensor_column] = f" ({r.offset_seconds:+.4f}s)"
                 else:
-                    suffixes[r.sensor_label] = " (ref)"
+                    suffixes[r.sensor_column] = " (ref)"
 
             self.main_plot.plot_depths_with_labels(
                 self.sensor_data, suffixes,
@@ -489,7 +438,7 @@ class AnalysisController:
             if (self.heave_plot is not None
                     and self._heave_profiles is not None
                     and self._heave_sel is not None):
-                ref_sensor = panel.get_ref_sensor()
+                ref_col = panel.get_ref_col()
                 low_freq, high_freq, filter_order = panel.get_filter_params()
                 start_idx, end_idx = self._heave_sel
 
@@ -500,7 +449,7 @@ class AnalysisController:
                 )
 
                 offsets_dict = {
-                    r.sensor_label: r.offset_seconds
+                    r.sensor_column: r.offset_seconds
                     for r in self.time_offset_results
                     if not r.is_reference
                 }
@@ -508,15 +457,16 @@ class AnalysisController:
                 self.heave_plot.plot_heave_corrected(
                     heaves_original=self._heave_profiles,
                     heaves_corrected=heaves_corrected,
-                    ref_sensor=ref_sensor,
+                    ref_col=ref_col,
                     offsets=offsets_dict,
                     time_axis=self._heave_time_axis,
                 )
 
             for r in self.time_offset_results:
                 if not r.is_reference:
+                    short = SensorData.get_short_name(r.sensor_column)
                     panel.log_widget.log(
-                        f"Applied {r.offset_seconds:+.4f}s shift to Sensor {r.sensor_label}"
+                        f"Applied {r.offset_seconds:+.4f}s shift to {short}"
                     )
             panel.log_widget.log("Time corrections applied!")
 
@@ -532,8 +482,9 @@ class AnalysisController:
         """Load a cast file for calibration creation."""
         try:
             panel = self.calibration_panel
-            panel.cast_label.setText(f"File: {Path(file_path).name}\nReady to process.")
-            # Store the path for processing
+            panel.cast_label.setText(
+                f"File: {Path(file_path).name}\nReady to process."
+            )
             self._cast_file_path = file_path
             panel.log_widget.log(f"Cast selected: {Path(file_path).name}")
         except Exception as e:
@@ -559,7 +510,9 @@ class AnalysisController:
                 skip_rows=params['skip_rows'],
             )
 
-            panel.log_widget.log(f"Loaded {data.row_count} rows, {data.num_sensors} sensors")
+            panel.log_widget.log(
+                f"Loaded {data.row_count} rows, {data.num_sensors} sensors"
+            )
 
             # Filter by depth
             df = data.df
@@ -570,7 +523,10 @@ class AnalysisController:
             for col in existing[1:]:
                 filter_depth = filter_depth.fillna(df[col])
 
-            mask = (filter_depth >= params['min_depth']) & (filter_depth <= params['max_depth'])
+            mask = (
+                (filter_depth >= params['min_depth'])
+                & (filter_depth <= params['max_depth'])
+            )
             df = df[mask].copy()
             panel.log_widget.log(f"After depth filter: {len(df)} rows")
 
@@ -593,7 +549,9 @@ class AnalysisController:
             self.main_plot.set_sensor_data(self.sensor_data)
             self.main_plot.plot_depths(self.sensor_data)
 
-            panel.update_cast_info(data.source_file, data.num_sensors, data.row_count)
+            panel.update_cast_info(
+                data.source_file, data.num_sensors, data.row_count,
+            )
             self._update_all_panels_file_info()
             panel.log_widget.log("Cast processed and plotted!")
 
@@ -614,28 +572,22 @@ class AnalysisController:
 
         try:
             start_idx, end_idx = sel
-            panel = self.calibration_panel
 
-            # Get sensor patterns for identification
-            patterns = panel.get_sensor_patterns()
-            pattern_dict = {}
-            for i, p in enumerate(patterns):
-                if i < len(self.sensor_data.sensor_labels):
-                    pattern_dict[self.sensor_data.sensor_labels[i]] = p
-
-            stats = compute_statistics(
-                self.sensor_data, start_idx, end_idx, pattern_dict
-            )
+            stats = compute_statistics(self.sensor_data, start_idx, end_idx)
             self.collected_statistics.append(stats)
 
             # Update stats table
             if self.statistics_table is not None:
                 if self.statistics_table.count == 0:
-                    self.statistics_table.set_columns(self.sensor_data.sensor_labels)
+                    self.statistics_table.set_columns(
+                        self.sensor_data.depth_columns,
+                    )
                 self.statistics_table.add_statistics(stats)
 
-            panel.update_stats_count(len(self.collected_statistics))
-            panel.log_widget.log(
+            self.calibration_panel.update_stats_count(
+                len(self.collected_statistics),
+            )
+            self.calibration_panel.log_widget.log(
                 f"Added stats: depth={stats.mean_depth_all_sensors:.1f}m, "
                 f"n={stats.n_points}"
             )
@@ -653,10 +605,19 @@ class AnalysisController:
         try:
             panel = self.calibration_panel
             n = panel.num_sensors_spin.value()
-            labels = SENSOR_LABELS[:n]
+
+            # Build col_to_label mapping from column position
+            # The calibration file uses A, B, C ... labels
+            from ..domain.processing.calibration_builder import DEFAULT_CAL_LABELS
+            labels = DEFAULT_CAL_LABELS[:n]
+            col_to_label = None
+            if self.sensor_data is not None:
+                cols = self.sensor_data.depth_columns[:n]
+                col_to_label = {col: label for col, label in zip(cols, labels)}
 
             self.generated_calibration = CalibrationBuilder.build(
-                self.collected_statistics, n, labels
+                self.collected_statistics, n, labels,
+                col_to_label=col_to_label,
             )
 
             # Build summary
@@ -664,7 +625,8 @@ class AnalysisController:
             for reg in self.generated_calibration.regressions:
                 summary_lines.append(
                     f"  {reg.sensor_j}-{reg.sensor_i}: "
-                    f"y={reg.slope:.6f}x + {reg.intercept:.6f} (R²={reg.r_squared:.4f})"
+                    f"y={reg.slope:.6f}x + {reg.intercept:.6f} "
+                    f"(R\u00b2={reg.r_squared:.4f})"
                 )
             summary = "\n".join(summary_lines)
 
@@ -715,13 +677,15 @@ class AnalysisController:
             panel.log_widget.log(f"Edge buffer={edge_buffer} samples")
             panel.log_widget.log(f"{'='*50}")
 
-            # Build depth arrays (interpolated)
+            # Build depth arrays keyed by column name (interpolated)
             depths = {}
-            for label in self.sensor_data.sensor_labels:
-                col = f'Sensor_{label}_Depth'
+            for col in self.sensor_data.depth_columns:
                 if col in self.sensor_data.df.columns:
-                    vals = self.sensor_data.df[col].interpolate().ffill().bfill().values
-                    depths[label] = vals
+                    vals = (
+                        self.sensor_data.df[col]
+                        .interpolate().ffill().bfill().values
+                    )
+                    depths[col] = vals
 
             if len(depths) < 2:
                 self._show_warning("Need at least 2 sensors for trip detection")
@@ -743,14 +707,13 @@ class AnalysisController:
             panel.log_widget.log(f"\n{result.summary}")
             panel.display_result(result.summary)
 
-            # Store result for export
             self.trip_detection_result = result
 
-            # Build short names for display
-            short_names = {
-                label: self.sensor_data.get_original_short_name(label)
-                for label in self.sensor_data.sensor_labels
-            }
+            # Auto-fill trip time on piston panel
+            if self.piston_panel is not None and result.trip_datetime is not None:
+                self.piston_panel.set_trip_time(
+                    str(result.trip_datetime), source='trip detector',
+                )
 
             # Show trip line on the main depth plot
             self.plot_depths()
@@ -758,7 +721,7 @@ class AnalysisController:
 
             # Show derivative plots on secondary view
             if self.trip_plot is not None:
-                self.trip_plot.plot_trip_result(result, sensor_short_names=short_names)
+                self.trip_plot.plot_trip_result(result)
                 self.main_window.show_secondary_view('trip')
 
             panel.log_widget.log("Trip detection complete!")
@@ -766,6 +729,214 @@ class AnalysisController:
         except Exception as e:
             self._show_error("Trip Detection Error", str(e))
             self.trip_panel.log_widget.log(f"ERROR: {e}")
+
+    # ==================================================================
+    # Piston Position Mode
+    # ==================================================================
+
+    def calculate_piston(self):
+        """Calculate and plot the piston position estimate."""
+        if self.sensor_data is None:
+            self._show_warning("No data loaded")
+            return
+
+        panel = self.piston_panel
+        ws_col = panel.get_weight_stand_col()
+        rel_col = panel.get_release_col()
+        scope_ft = panel.get_scope()
+        core_ft = panel.get_core_length()
+        offset_constant = panel.get_offset_constant()
+
+        if ws_col is None or rel_col is None:
+            self._show_warning("Select both Weight Stand and Release Device sensors")
+            return
+        if scope_ft <= 0 or core_ft <= 0:
+            self._show_warning("Scope and Core Length must be > 0")
+            return
+
+        try:
+            if ws_col not in self.sensor_data.df.columns:
+                self._show_warning(
+                    f"Weight Stand column not found: "
+                    f"{SensorData.get_short_name(ws_col)}"
+                )
+                return
+            if rel_col not in self.sensor_data.df.columns:
+                self._show_warning(
+                    f"Release Device column not found: "
+                    f"{SensorData.get_short_name(rel_col)}"
+                )
+                return
+
+            ws_vals = (
+                self.sensor_data.df[ws_col]
+                .interpolate().ffill().bfill().values
+            )
+            rel_vals = (
+                self.sensor_data.df[rel_col]
+                .interpolate().ffill().bfill().values
+            )
+
+            # Determine trip index for gating start_core detection
+            trip_idx = self._resolve_trip_index()
+
+            # Detect start_core (only searches AFTER trip_idx)
+            start_idx = detect_start_core(
+                ws_vals, rel_vals, scope_ft, trip_idx=trip_idx,
+            )
+            self._piston_start_core_idx = start_idx
+
+            n_total = len(ws_vals)
+            if start_idx >= n_total - 1:
+                panel.log_widget.log(
+                    "Warning: start_core not detected – the "
+                    "|release − weight_stand| separation never "
+                    "exceeded scope after the trip point.  "
+                    "You can drag the red start-core line to "
+                    "set it manually."
+                )
+
+            self._plot_piston(
+                ws_vals, rel_vals, scope_ft, core_ft, start_idx,
+                offset_constant,
+            )
+
+            # Update panel info
+            dt_col = self.sensor_data.datetime_col
+            ts_str = ''
+            if (dt_col in self.sensor_data.df.columns
+                    and 0 <= start_idx < len(self.sensor_data.df)):
+                ts = self.sensor_data.df[dt_col].iloc[start_idx]
+                if pd.notna(ts):
+                    ts_str = str(ts)
+            panel.update_start_core_info(start_idx, ts_str)
+
+            ws_short = SensorData.get_short_name(ws_col)
+            rel_short = SensorData.get_short_name(rel_col)
+            panel.log_widget.log(
+                f"Weight Stand: {ws_short}, Release: {rel_short}"
+            )
+            panel.log_widget.log(
+                f"Scope: {scope_ft} ft, Core length: {core_ft} ft"
+            )
+            panel.log_widget.log(f"Offset constant: {offset_constant} m")
+            panel.log_widget.log(f"Trip index (gate): {trip_idx}")
+            panel.log_widget.log(f"Start core detected at index {start_idx}")
+            if ts_str:
+                panel.log_widget.log(f"  Time: {ts_str}")
+            panel.log_widget.log("Piston position plotted!")
+
+        except Exception as e:
+            self._show_error("Piston Calculation Error", str(e))
+            panel.log_widget.log(f"ERROR: {e}")
+
+    def _plot_piston(self, ws_vals, rel_vals, scope_ft, core_ft, start_idx,
+                     offset_constant: float = 1.25):
+        """Compute piston position and overlay on the depth plot."""
+        piston = compute_piston_position(
+            ws_vals, rel_vals, scope_ft, core_ft, start_idx,
+            offset_constant=offset_constant,
+        )
+        x = self.sensor_data.get_timestamps_epoch()
+
+        # Plot base depth traces first
+        self.plot_depths()
+
+        # Re-add trip line if we have a result (plot_depths clears it)
+        if (hasattr(self, 'trip_detection_result')
+                and self.trip_detection_result is not None):
+            self.main_plot.add_trip_line(
+                self.trip_detection_result.trip_index,
+            )
+
+        # Add piston trace
+        self.main_plot.add_piston_trace(x, piston)
+
+        # Add draggable start_core line
+        if 0 <= start_idx < len(x):
+            self.main_plot.add_start_core_line(float(x[start_idx]))
+
+    def _resolve_trip_index(self) -> int:
+        """Determine the trip gate index for start_core detection.
+
+        Priority:
+        1. Trip time entered / selected on the piston panel (epoch).
+        2. Trip detection result stored from the trip-detector mode.
+        3. Fallback: 0 (search from beginning).
+        """
+        if self.sensor_data is None:
+            return 0
+
+        panel = self.piston_panel
+        trip_epoch = panel.get_trip_time_epoch()
+
+        # Check if the panel has a meaningful trip time set
+        # (QDateTimeEdit defaults to 2000-01-01 -> epoch ~946684800)
+        if trip_epoch > 946684800:
+            x = self.sensor_data.get_timestamps_epoch()
+            if len(x) > 0:
+                idx = int(np.searchsorted(x, trip_epoch))
+                return min(idx, len(x) - 1)
+
+        # No panel trip time -- try stored detection result
+        if (hasattr(self, 'trip_detection_result')
+                and self.trip_detection_result is not None):
+            return self.trip_detection_result.trip_index
+
+        return 0
+
+    def _on_start_core_moved(self, new_idx: int):
+        """Handle the user dragging the start_core line to a new position."""
+        if self.sensor_data is None:
+            return
+        mode = (
+            self.main_window.get_current_mode() if self.main_window else None
+        )
+        if mode != 'Piston Position':
+            return
+
+        panel = self.piston_panel
+        ws_col = panel.get_weight_stand_col()
+        rel_col = panel.get_release_col()
+        scope_ft = panel.get_scope()
+        core_ft = panel.get_core_length()
+        offset_constant = panel.get_offset_constant()
+
+        if ws_col is None or rel_col is None:
+            return
+
+        try:
+            ws_vals = (
+                self.sensor_data.df[ws_col]
+                .interpolate().ffill().bfill().values
+            )
+            rel_vals = (
+                self.sensor_data.df[rel_col]
+                .interpolate().ffill().bfill().values
+            )
+
+            self._piston_start_core_idx = new_idx
+
+            # Recompute piston with new start_core and update trace in-place
+            piston = compute_piston_position(
+                ws_vals, rel_vals, scope_ft, core_ft, new_idx,
+                offset_constant=offset_constant,
+            )
+            self.main_plot.update_piston_trace(piston)
+
+            # Update panel info
+            dt_col = self.sensor_data.datetime_col
+            ts_str = ''
+            if (dt_col in self.sensor_data.df.columns
+                    and 0 <= new_idx < len(self.sensor_data.df)):
+                ts = self.sensor_data.df[dt_col].iloc[new_idx]
+                if pd.notna(ts):
+                    ts_str = str(ts)
+            panel.update_start_core_info(new_idx, ts_str)
+            panel.log_widget.log(f"Start core moved to index {new_idx}")
+
+        except Exception as e:
+            panel.log_widget.log(f"ERROR updating piston: {e}")
 
     # ==================================================================
     # Common Operations
@@ -816,7 +987,10 @@ class AnalysisController:
             return
 
         # Generate default filename
-        core_name = self.sensor_data.core_title.replace(' ', '_') if self.sensor_data.core_title else 'data'
+        core_name = (
+            self.sensor_data.core_title.replace(' ', '_')
+            if self.sensor_data.core_title else 'data'
+        )
         timestamp = pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')
         default_name = f"{core_name}_corrected_{timestamp}.csv"
 
@@ -841,10 +1015,9 @@ class AnalysisController:
     def _write_trip_csv(self, file_path: str):
         """Write CSV with full metadata header including trip and corrections."""
         from datetime import datetime
-        
-        # Get the original file path to read metadata
+
         header_lines = []
-        
+
         # Try to read original header from source file
         if self._loaded_file_path and Path(self._loaded_file_path).exists():
             try:
@@ -853,11 +1026,11 @@ class AnalysisController:
                         if line.startswith('#') and not line.strip() == '#':
                             header_lines.append(line.rstrip())
                         elif line.strip().startswith('datetime'):
-                            break  # Stop at data header
-            except:
-                pass  # If we can't read it, we'll generate basic header
-        
-        # If we couldn't read the original or it's a different file, create basic header
+                            break
+            except Exception:
+                pass
+
+        # If we couldn't read the original, create basic header
         if not header_lines:
             header_lines = [
                 "# Export from Sediment App - Sensor Alignment Tool",
@@ -865,51 +1038,65 @@ class AnalysisController:
             ]
             if self.sensor_data.core_title:
                 header_lines.append(f"# Core: {self.sensor_data.core_title}")
-            header_lines.extend([
-                f"# Data shape: {self.sensor_data.row_count:,} rows × {len(self.sensor_data.df.columns)} columns",
-            ])
+            header_lines.append(
+                f"# Data shape: {self.sensor_data.row_count:,} rows "
+                f"\u00d7 {len(self.sensor_data.df.columns)} columns"
+            )
             time_range = self.sensor_data.time_range
             if time_range:
-                header_lines.append(f"# Time range: {time_range[0]} to {time_range[1]}")
-        
+                header_lines.append(
+                    f"# Time range: {time_range[0]} to {time_range[1]}"
+                )
+
         # Add trip detection info
         trip = self.trip_detection_result
         header_lines.append("#")
-        header_lines.append(f"# Trip detected at: {trip.trip_datetime} (index: {trip.trip_index})")
-        
+        header_lines.append(
+            f"# Trip detected at: {trip.trip_datetime} "
+            f"(index: {trip.trip_index})"
+        )
+
         # Add correction information
         if self.sensor_data.corrections:
             header_lines.append("#")
-            time_corrections = [c for c in self.sensor_data.corrections if c.correction_type == 'time_shift']
-            depth_corrections = [c for c in self.sensor_data.corrections 
-                                if c.correction_type in ('depth_calibration', 'depth_manual')]
-            
+            time_corrections = [
+                c for c in self.sensor_data.corrections
+                if c.correction_type == 'time_shift'
+            ]
+            depth_corrections = [
+                c for c in self.sensor_data.corrections
+                if c.correction_type in ('depth_calibration', 'depth_manual')
+            ]
+
             if time_corrections:
                 header_lines.append("# Time corrections applied:")
                 for corr in time_corrections:
                     shift = corr.parameters.get('shift_seconds', 0)
                     sign = '+' if shift >= 0 else ''
-                    header_lines.append(f"#   Sensor {corr.sensor_label}: {sign}{shift:.2f}s")
-            
+                    short = SensorData.get_short_name(corr.sensor_column)
+                    header_lines.append(
+                        f"#   {short}: {sign}{shift:.2f}s"
+                    )
+
             if depth_corrections:
                 header_lines.append("# Depth corrections applied:")
                 for corr in depth_corrections:
                     offset = corr.parameters.get('offset', 0)
                     sign = '+' if offset >= 0 else ''
-                    header_lines.append(f"#   Sensor {corr.sensor_label}: {sign}{offset:.3f}m")
+                    short = SensorData.get_short_name(corr.sensor_column)
+                    header_lines.append(
+                        f"#   {short}: {sign}{offset:.3f}m"
+                    )
         else:
             header_lines.append("#")
             header_lines.append("# No corrections applied")
-        
+
         header_lines.append("#")
-        
+
         # Write file
         with open(file_path, 'w', encoding='utf-8', newline='') as f:
-            # Write header
             for line in header_lines:
                 f.write(line + '\n')
-            
-            # Write data
             self.sensor_data.df.to_csv(f, index=False)
 
     # ==================================================================
@@ -921,8 +1108,9 @@ class AnalysisController:
 
     def _clear_selection(self):
         self.main_plot.clear_selection()
-        # Update active panel's selection info
-        mode = self.main_window.get_current_mode() if self.main_window else None
+        mode = (
+            self.main_window.get_current_mode() if self.main_window else None
+        )
         if mode == 'Time Offset':
             self.time_panel.selection_controls.clear_info()
         elif mode == 'Create Calibration':
@@ -930,7 +1118,9 @@ class AnalysisController:
 
     def _on_selection_changed(self, start_idx: int, end_idx: int):
         """Called when user completes a selection on the main plot."""
-        mode = self.main_window.get_current_mode() if self.main_window else None
+        mode = (
+            self.main_window.get_current_mode() if self.main_window else None
+        )
 
         n = end_idx - start_idx + 1
         extra = ''
@@ -943,11 +1133,11 @@ class AnalysisController:
 
         if mode == 'Time Offset':
             self.time_panel.selection_controls.update_selection_info(
-                start_idx, end_idx, extra
+                start_idx, end_idx, extra,
             )
         elif mode == 'Create Calibration':
             self.calibration_panel.selection_controls.update_selection_info(
-                start_idx, end_idx, extra
+                start_idx, end_idx, extra,
             )
 
     def _on_selection_cleared(self):
@@ -986,6 +1176,11 @@ class AnalysisController:
         else:
             self.main_window.hide_secondary_view()
 
+        # Clean up piston overlays when leaving Piston Position mode
+        if mode_name != 'Piston Position':
+            self.main_plot.remove_piston_trace()
+            self.main_plot.remove_start_core_line()
+
         # Re-plot current data if available
         if self.sensor_data is not None:
             self.main_plot.set_sensor_data(self.sensor_data)
@@ -995,7 +1190,7 @@ class AnalysisController:
     # ==================================================================
 
     def _update_all_panels_file_info(self):
-        """Update file info on all panels."""
+        """Update file info on all panels after data load."""
         if self.sensor_data is None:
             return
 
@@ -1020,35 +1215,48 @@ class AnalysisController:
                 sd.source_file, sd.num_sensors, sd.row_count,
             )
 
-        # Set up sensor assignments with ORIGINAL column names
-        if sd.num_sensors > 0 and sd.original_depth_columns:
-            # Get original column names in sensor-label order
-            original_cols = []
-            current_assignments = {}
-            for label in sd.sensor_labels:
-                renamed_col = f'Sensor_{label}_Depth'
-                orig_col = sd.original_depth_columns.get(renamed_col, renamed_col)
-                original_cols.append(orig_col)
-                current_assignments[orig_col] = label
+        # Set up manual offsets on the depth panel
+        self.depth_panel.setup_manual_offsets(sd.depth_columns)
+        self.depth_panel.log_widget.log(
+            f"Found {len(sd.depth_columns)} depth columns:"
+        )
+        for col in sd.depth_columns:
+            short = SensorData.get_short_name(col)
+            self.depth_panel.log_widget.log(f"  {short}")
 
-            self.depth_panel.setup_sensor_assignments(
-                original_cols, current_assignments,
+        # Populate calibration mapping if calibration already loaded
+        if self.calibration is not None:
+            self.depth_panel.setup_calibration_mapping(
+                self.calibration.sensor_labels, sd.depth_columns,
             )
-            self.depth_panel.log_widget.log(
-                f"Found {len(original_cols)} depth columns:"
+
+        # Populate time offset ref sensor combo
+        self.time_panel.populate_ref_sensor_combo(sd.depth_columns)
+
+        # Update piston panel
+        if self.piston_panel is not None:
+            self.piston_panel.update_file_info(
+                sd.source_file, sd.num_sensors, sd.row_count,
+                sd.core_title,
             )
-            for orig_col, label in current_assignments.items():
-                parts = orig_col.split('_')
-                short = parts[0]
-                if len(parts) > 1:
-                    short = f"{short} ({parts[1].removesuffix('.rsk')})"
-                self.depth_panel.log_widget.log(
-                    f"  {short} → Sensor {label}"
-                )
+            # Populate sensor combos with (column, display_name) tuples
+            columns_and_names = [
+                (col, SensorData.get_location_name(col))
+                for col in sd.depth_columns
+            ]
+            ws_col = sd.find_column_by_location('Weight Stand')
+            rel_col = sd.find_column_by_location('Release')
+            self.piston_panel.populate_sensor_combos(
+                columns_and_names, ws_col, rel_col,
+            )
+            # Pre-fill parameters from metadata
+            self.piston_panel.set_parameters_from_metadata(sd.metadata)
 
     def _log_active(self, msg: str):
         """Log to the currently active panel."""
-        mode = self.main_window.get_current_mode() if self.main_window else None
+        mode = (
+            self.main_window.get_current_mode() if self.main_window else None
+        )
         if mode == 'View Data':
             self.view_panel.log_widget.log(msg)
         elif mode == 'Depth Offset':
@@ -1059,6 +1267,8 @@ class AnalysisController:
             self.calibration_panel.log_widget.log(msg)
         elif mode == 'Trip Detector':
             self.trip_panel.log_widget.log(msg)
+        elif mode == 'Piston Position':
+            self.piston_panel.log_widget.log(msg)
 
     def _show_error(self, title: str, msg: str):
         if self.main_window:

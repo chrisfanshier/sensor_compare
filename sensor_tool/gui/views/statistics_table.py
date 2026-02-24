@@ -11,13 +11,14 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Signal
 
+from ...domain.models.sensor_data import SensorData
 from ...domain.models.analysis_result import StatisticsResult
 
 
 class StatisticsTableView(QWidget):
     """
     Table widget displaying collected statistics rows.
-    
+
     Signals:
         row_removed(int): Emitted when a row is removed.
         cleared: Emitted when all rows are cleared.
@@ -30,18 +31,17 @@ class StatisticsTableView(QWidget):
         super().__init__(parent)
         self._stats: list[StatisticsResult] = []
         self._columns: list[str] = []
+        self._depth_columns: list[str] = []
         self._setup_ui()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # Table
         self.table = QTableWidget()
         self.table.setMinimumHeight(120)
         layout.addWidget(self.table)
 
-        # Button row
         btn_layout = QHBoxLayout()
         self.remove_btn = QPushButton("Remove Selected")
         self.remove_btn.clicked.connect(self._remove_selected)
@@ -57,14 +57,17 @@ class StatisticsTableView(QWidget):
 
         layout.addLayout(btn_layout)
 
-    def set_columns(self, sensor_labels: list[str]):
-        """Configure table columns based on sensor labels."""
+    def set_columns(self, depth_columns: list[str]):
+        """Configure table columns based on depth column names."""
+        self._depth_columns = list(depth_columns)
         cols = ['#', 'Mean Depth']
 
-        for i, label_i in enumerate(sensor_labels):
-            for j in range(i + 1, len(sensor_labels)):
-                label_j = sensor_labels[j]
-                cols.append(f'{label_j}-{label_i}')
+        for i, col_i in enumerate(depth_columns):
+            for j in range(i + 1, len(depth_columns)):
+                col_j = depth_columns[j]
+                short_j = SensorData.get_short_name(col_j)
+                short_i = SensorData.get_short_name(col_i)
+                cols.append(f'{short_j}-{short_i}')
 
         cols.extend(['N Points', 'Source File'])
         self._columns = cols
@@ -74,7 +77,6 @@ class StatisticsTableView(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
 
     def add_statistics(self, stats: StatisticsResult):
-        """Add a statistics row to the table."""
         self._stats.append(stats)
         self._refresh_table()
 
@@ -89,7 +91,6 @@ class StatisticsTableView(QWidget):
     def _refresh_table(self):
         self.table.setRowCount(len(self._stats))
         for row_idx, stats in enumerate(self._stats):
-            flat = stats.to_flat_dict()
             col_idx = 0
             # Row number
             self.table.setItem(row_idx, col_idx, QTableWidgetItem(str(row_idx + 1)))
@@ -124,5 +125,4 @@ class StatisticsTableView(QWidget):
         self.cleared.emit()
 
     def to_dataframe(self) -> pd.DataFrame:
-        """Export collected stats as a DataFrame."""
         return pd.DataFrame([s.to_flat_dict() for s in self._stats])
