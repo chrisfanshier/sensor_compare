@@ -36,6 +36,7 @@ class SensorPlotView(QWidget):
     selection_changed = Signal(int, int)
     selection_cleared = Signal()
     start_core_changed = Signal(int)
+    trip_line_changed = Signal(int)
 
     def __init__(self, parent=None, use_datetime_axis: bool = True):
         super().__init__(parent)
@@ -51,6 +52,7 @@ class SensorPlotView(QWidget):
         self._y_inverted = False
         self._piston_plot_item = None
         self._start_core_line: pg.InfiniteLine | None = None
+        self._trip_line: pg.InfiniteLine | None = None
 
         self._setup_ui()
 
@@ -213,7 +215,6 @@ class SensorPlotView(QWidget):
 
     def clear(self):
         self._clear_plot()
-        self._trip_line = None
 
     def add_trip_line(self, trip_index: int):
         if self._sensor_data is None:
@@ -228,19 +229,41 @@ class SensorPlotView(QWidget):
         else:
             x_pos = float(trip_index)
 
-        if hasattr(self, '_trip_line') and self._trip_line is not None:
-            try:
-                self.plot_widget.removeItem(self._trip_line)
-            except Exception:
-                pass
+        self.remove_trip_line()
 
         self._trip_line = pg.InfiniteLine(
-            pos=x_pos, angle=90,
+            pos=x_pos, angle=90, movable=True,
             pen=pg.mkPen('r', width=2, style=Qt.DashLine),
             label='Trip',
             labelOpts={'position': 0.9, 'color': 'r'},
         )
+        self._trip_line.sigPositionChangeFinished.connect(self._on_trip_line_moved)
         self.plot_widget.addItem(self._trip_line)
+
+    def remove_trip_line(self):
+        if self._trip_line is not None:
+            try:
+                self._trip_line.sigPositionChangeFinished.disconnect(
+                    self._on_trip_line_moved
+                )
+            except Exception:
+                pass
+            try:
+                self.plot_widget.removeItem(self._trip_line)
+            except Exception:
+                pass
+            self._trip_line = None
+
+    def _on_trip_line_moved(self):
+        if self._trip_line is None or self._sensor_data is None:
+            return
+        x_pos = self._trip_line.value()
+        if self._use_datetime_axis:
+            timestamps = self._sensor_data.get_timestamps_epoch()
+            idx = int(np.argmin(np.abs(timestamps - x_pos)))
+        else:
+            idx = max(0, min(int(round(x_pos)), len(self._sensor_data.df) - 1))
+        self.trip_line_changed.emit(idx)
 
     # ------------------------------------------------------------------
     # Piston position helpers
@@ -354,6 +377,10 @@ class SensorPlotView(QWidget):
                 except Exception:
                     pass
                 self._selection_region = None
+
+            self.remove_trip_line()
+            self.remove_start_core_line()
+            self._piston_plot_item = None
 
             self.plot_widget.clear()
             self.plot_widget.addLegend()

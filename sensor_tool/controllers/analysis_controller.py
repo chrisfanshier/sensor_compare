@@ -57,6 +57,7 @@ class AnalysisController:
         self._heave_sel: Optional[tuple[int, int]] = None
         self.collected_statistics: list[StatisticsResult] = []
         self._piston_start_core_idx: Optional[int] = None
+        self._piston_values: Optional[np.ndarray] = None
 
         # GUI references (set by main_window after construction)
         self.main_window = None
@@ -136,6 +137,12 @@ class AnalysisController:
 
         # Main plot start_core drag signal
         self.main_plot.start_core_changed.connect(self._on_start_core_moved)
+
+        # Main plot trip line drag signal
+        self.main_plot.trip_line_changed.connect(self._on_trip_line_moved)
+
+        # Piston export
+        self.piston_panel.export_piston_requested.connect(self.export_piston_csv)
 
     # ==================================================================
     # Data Loading
@@ -849,6 +856,9 @@ class AnalysisController:
                 self.trip_detection_result.trip_index,
             )
 
+        # Store piston values for export
+        self._piston_values = piston
+
         # Add piston trace
         self.main_plot.add_piston_trace(x, piston)
 
@@ -922,6 +932,7 @@ class AnalysisController:
                 ws_vals, rel_vals, scope_ft, core_ft, new_idx,
                 offset_constant=offset_constant,
             )
+            self._piston_values = piston
             self.main_plot.update_piston_trace(piston)
 
             # Update panel info
@@ -937,6 +948,89 @@ class AnalysisController:
 
         except Exception as e:
             panel.log_widget.log(f"ERROR updating piston: {e}")
+
+    def _on_trip_line_moved(self, new_idx: int):
+        """Handle the user dragging the trip line to a new position."""
+        if self.sensor_data is None:
+            return
+
+        # Update stored trip index in detection result (if available)
+        if self.trip_detection_result is not None:
+            self.trip_detection_result.trip_index = new_idx
+
+        # Update the trip time widget on the piston panel
+        if self.piston_panel is not None:
+            dt_col = self.sensor_data.datetime_col
+            if (dt_col in self.sensor_data.df.columns
+                    and 0 <= new_idx < len(self.sensor_data.df)):
+                ts = self.sensor_data.df[dt_col].iloc[new_idx]
+                if pd.notna(ts):
+                    self.piston_panel.set_trip_time(str(ts), source='plot drag')
+
+        # If piston has already been calculated, recalculate with new trip gate
+        mode = (
+            self.main_window.get_current_mode() if self.main_window else None
+        )
+        if mode != 'Piston Position' or self._piston_start_core_idx is None:
+            return
+
+        panel = self.piston_panel
+        ws_col = panel.get_weight_stand_col()
+        rel_col = panel.get_release_col()
+        scope_ft = panel.get_scope()
+        core_ft = panel.get_core_length()
+        offset_constant = panel.get_offset_constant()
+
+        if ws_col is None or rel_col is None or scope_ft <= 0 or core_ft <= 0:
+            return
+
+        try:
+            ws_vals = (
+                self.sensor_data.df[ws_col]
+                .interpolate().ffill().bfill().values
+            )
+            rel_vals = (
+                self.sensor_data.df[rel_col]
+                .interpolate().ffill().bfill().values
+            )
+
+            start_idx = self._piston_start_core_idx
+
+            # If start_core would now be before the new trip gate, re-detect it
+            if start_idx < new_idx:
+                start_idx = detect_start_core(
+                    ws_vals, rel_vals, scope_ft, trip_idx=new_idx,
+                )
+                self._piston_start_core_idx = start_idx
+
+                # Move the start_core line to the new position
+                x_all = self.sensor_data.get_timestamps_epoch()
+                if 0 <= start_idx < len(x_all):
+                    self.main_plot.remove_start_core_line()
+                    self.main_plot.add_start_core_line(float(x_all[start_idx]))
+
+                # Update start_core info in panel
+                dt_col = self.sensor_data.datetime_col
+                ts_str = ''
+                if (dt_col in self.sensor_data.df.columns
+                        and 0 <= start_idx < len(self.sensor_data.df)):
+                    ts = self.sensor_data.df[dt_col].iloc[start_idx]
+                    if pd.notna(ts):
+                        ts_str = str(ts)
+                panel.update_start_core_info(start_idx, ts_str)
+
+            piston = compute_piston_position(
+                ws_vals, rel_vals, scope_ft, core_ft, start_idx,
+                offset_constant=offset_constant,
+            )
+            self._piston_values = piston
+            self.main_plot.update_piston_trace(piston)
+            panel.log_widget.log(
+                f"Trip line moved to index {new_idx}, piston recalculated"
+            )
+
+        except Exception as e:
+            panel.log_widget.log(f"ERROR updating piston after trip move: {e}")
 
     # ==================================================================
     # Common Operations
@@ -1098,6 +1192,148 @@ class AnalysisController:
             for line in header_lines:
                 f.write(line + '\n')
             self.sensor_data.df.to_csv(f, index=False)
+
+    def export_piston_csv(self):
+        """Export sensor data with a piston_position column and piston metadata."""
+        if self.sensor_data is None:
+            self._show_warning("No data to export")
+            return
+
+        if self._piston_values is None:
+            self._show_warning(
+                "No piston position calculated yet.\n"
+                "Click 'Calculate & Plot Piston' first."
+            )
+            return
+
+        core_name = (
+            self.sensor_data.core_title.replace(' ', '_')
+            if self.sensor_data.core_title else 'data'
+        )
+        timestamp = pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')
+        default_name = f"{core_name}_piston_{timestamp}.csv"
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self.main_window, "Export Piston Data", default_name,
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if not file_path:
+            return
+
+        try:
+            self._write_piston_csv(file_path)
+            self._log_active(f"Exported to {Path(file_path).name}")
+            QMessageBox.information(
+                self.main_window, "Success",
+                "Piston data exported successfully!"
+            )
+        except Exception as e:
+            self._show_error("Export Error", str(e))
+
+    def _write_piston_csv(self, file_path: str):
+        """Write CSV with piston_position column and full metadata header."""
+        from datetime import datetime
+
+        header_lines = []
+
+        # Try to read original header from source file
+        if self._loaded_file_path and Path(self._loaded_file_path).exists():
+            try:
+                with open(self._loaded_file_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if line.startswith('#') and not line.strip() == '#':
+                            header_lines.append(line.rstrip())
+                        elif line.strip().startswith('datetime'):
+                            break
+            except Exception:
+                pass
+
+        if not header_lines:
+            header_lines = [
+                "# Export from Sediment App - Sensor Alignment Tool",
+                f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            ]
+            if self.sensor_data.core_title:
+                header_lines.append(f"# Core: {self.sensor_data.core_title}")
+            header_lines.append(
+                f"# Data shape: {self.sensor_data.row_count:,} rows "
+                f"\u00d7 {len(self.sensor_data.df.columns)} columns"
+            )
+            time_range = self.sensor_data.time_range
+            if time_range:
+                header_lines.append(
+                    f"# Time range: {time_range[0]} to {time_range[1]}"
+                )
+
+        # Trip time metadata
+        panel = self.piston_panel
+        header_lines.append("#")
+        qdt = panel.trip_time_edit.dateTime()
+        d, t = qdt.date(), qdt.time()
+        trip_str = (
+            f"{d.year()}-{d.month():02d}-{d.day():02d} "
+            f"{t.hour():02d}:{t.minute():02d}:{t.second():02d}"
+            f".{t.msec():03d}"
+        )
+        header_lines.append(f"# trip_time: {trip_str}")
+
+        # Start core metadata
+        start_idx = self._piston_start_core_idx
+        if start_idx is not None:
+            header_lines.append(f"# start_core_index: {start_idx}")
+            dt_col = self.sensor_data.datetime_col
+            if (dt_col in self.sensor_data.df.columns
+                    and 0 <= start_idx < len(self.sensor_data.df)):
+                ts = self.sensor_data.df[dt_col].iloc[start_idx]
+                if pd.notna(ts):
+                    header_lines.append(f"# start_core_time: {ts}")
+
+        # Offsets from corrections
+        if self.sensor_data.corrections:
+            time_corrections = [
+                c for c in self.sensor_data.corrections
+                if c.correction_type == 'time_shift'
+            ]
+            depth_corrections = [
+                c for c in self.sensor_data.corrections
+                if c.correction_type in ('depth_calibration', 'depth_manual')
+            ]
+
+            if time_corrections:
+                header_lines.append("#")
+                header_lines.append("# Time corrections applied:")
+                for corr in time_corrections:
+                    shift = corr.parameters.get('shift_seconds', 0)
+                    sign = '+' if shift >= 0 else ''
+                    short = SensorData.get_short_name(corr.sensor_column)
+                    header_lines.append(f"#   {short}: {sign}{shift:.4f}s")
+
+            if depth_corrections:
+                header_lines.append("#")
+                header_lines.append("# Depth corrections applied:")
+                for corr in depth_corrections:
+                    offset = corr.parameters.get('offset', 0)
+                    sign = '+' if offset >= 0 else ''
+                    short = SensorData.get_short_name(corr.sensor_column)
+                    header_lines.append(f"#   {short}: {sign}{offset:.4f}m")
+        else:
+            header_lines.append("#")
+            header_lines.append("# No depth/time corrections applied")
+
+        header_lines.append("#")
+
+        # Build dataframe with piston_position column added
+        df_out = self.sensor_data.df.copy()
+        piston_col = np.full(len(df_out), np.nan)
+        n = min(len(self._piston_values), len(df_out))
+        piston_col[:n] = self._piston_values[:n]
+        df_out.insert(len(df_out.columns), 'piston_position', piston_col)
+
+        # Write file
+        with open(file_path, 'w', encoding='utf-8', newline='') as f:
+            for line in header_lines:
+                f.write(line + '\n')
+            df_out.to_csv(f, index=False)
 
     # ==================================================================
     # Selection handling

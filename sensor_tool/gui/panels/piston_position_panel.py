@@ -34,6 +34,7 @@ class PistonPositionPanel(BaseModePanel):
     load_file_requested = Signal(str)
     calculate_requested = Signal()
     plot_original_requested = Signal()
+    export_piston_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -147,6 +148,10 @@ class PistonPositionPanel(BaseModePanel):
         calc_btn = QPushButton("Calculate && Plot Piston")
         calc_btn.clicked.connect(self.calculate_requested.emit)
         action_layout.addWidget(calc_btn)
+
+        export_btn = QPushButton("Export Data")
+        export_btn.clicked.connect(self.export_piston_requested.emit)
+        action_layout.addWidget(export_btn)
 
         action_group.setLayout(action_layout)
         self._layout.addWidget(action_group)
