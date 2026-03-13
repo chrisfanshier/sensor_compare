@@ -53,6 +53,7 @@ class SensorPlotView(QWidget):
         self._piston_plot_item = None
         self._start_core_line: pg.InfiniteLine | None = None
         self._trip_line: pg.InfiniteLine | None = None
+        self._smoothed_plot_items: list = []
 
         self._setup_ui()
 
@@ -277,6 +278,59 @@ class SensorPlotView(QWidget):
             connect='finite', skipFiniteCheck=True,
         )
 
+    # ------------------------------------------------------------------
+    # Smoothed overlay helpers
+    # ------------------------------------------------------------------
+
+    def add_smoothed_traces(
+        self,
+        smoothed_data: dict[str, np.ndarray],
+        column_order: list[str],
+    ):
+        """Overlay bold smoothed traces and fade existing raw traces.
+
+        Parameters
+        ----------
+        smoothed_data : dict
+            depth_column_name -> smoothed depth array.
+        column_order : list[str]
+            Ordered depth column names (for consistent colour assignment).
+        """
+        self.remove_smoothed_traces()
+
+        x = self._sensor_data.get_timestamps_epoch() if self._sensor_data else None
+        if x is None:
+            return
+
+        # Fade existing raw traces (make them transparent)
+        for item in self.plot_widget.plotItem.listDataItems():
+            cur_pen = item.opts.get('pen')
+            if cur_pen is not None and item != self._piston_plot_item:
+                color = pg.mkColor(cur_pen.color())
+                color.setAlpha(60)
+                item.setPen(pg.mkPen(color, width=1))
+
+        # Add prominent smoothed traces
+        for col, smoothed in smoothed_data.items():
+            idx = column_order.index(col) if col in column_order else 0
+            base_color = SENSOR_COLORS[idx % len(SENSOR_COLORS)]
+            pen = pg.mkPen(color=base_color, width=3)
+            display_name = SensorData.get_location_name(col) + ' (smooth)'
+            item = self.plot_widget.plot(
+                x, smoothed, pen=pen, name=display_name,
+                connect='finite', skipFiniteCheck=True,
+            )
+            self._smoothed_plot_items.append(item)
+
+    def remove_smoothed_traces(self):
+        """Remove all smoothed overlay traces."""
+        for item in self._smoothed_plot_items:
+            try:
+                self.plot_widget.removeItem(item)
+            except Exception:
+                pass
+        self._smoothed_plot_items.clear()
+
     def update_piston_trace(self, piston_depths: np.ndarray):
         if self._piston_plot_item is not None and self._sensor_data is not None:
             x = self._sensor_data.get_timestamps_epoch()
@@ -381,6 +435,7 @@ class SensorPlotView(QWidget):
             self.remove_trip_line()
             self.remove_start_core_line()
             self._piston_plot_item = None
+            self._smoothed_plot_items.clear()
 
             self.plot_widget.clear()
             self.plot_widget.addLegend()
