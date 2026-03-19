@@ -30,6 +30,9 @@ from ..domain.processing.statistics import compute_statistics
 from ..domain.processing.piston_position import (
     compute_piston_position, detect_start_core,
 )
+from ..domain.processing.calculations import (
+    compute_calculations, format_results, apply_savgol,
+)
 from ..persistence.csv_loader import CSVLoader
 from ..persistence.calibration_io import CalibrationIO
 
@@ -74,6 +77,12 @@ class AnalysisController:
         self.calibration_panel = None
         self.trip_panel = None
         self.piston_panel = None
+        self.calculate_panel = None
+
+        # Calculate mode state
+        self._calc_start_core_idx: Optional[int] = None
+        self._last_calc_results = None
+        self._last_calc_inputs: Optional[dict] = None
 
     # ==================================================================
     # Initialization - called by MainWindow
@@ -144,6 +153,16 @@ class AnalysisController:
         # Piston export
         self.piston_panel.export_piston_requested.connect(self.export_piston_csv)
 
+        # Calculate panel
+        self.calculate_panel.load_file_requested.connect(self.load_export_csv)
+        self.calculate_panel.calculate_requested.connect(self.run_calculations)
+        self.calculate_panel.plot_original_requested.connect(
+            self._plot_calculate_mode
+        )
+        self.calculate_panel.export_results_requested.connect(
+            self.export_calculation_results
+        )
+
     # ==================================================================
     # Data Loading
     # ==================================================================
@@ -157,6 +176,15 @@ class AnalysisController:
             self.sensor_data = CSVLoader.load_export_csv(file_path)
             self.original_data = self.sensor_data.copy()
             self._loaded_file_path = file_path
+
+            # Clear stale state from previous file
+            self.trip_detection_result = None
+            self._piston_start_core_idx = None
+            self._piston_values = None
+            self._calc_start_core_idx = None
+            self._last_calc_results = None
+            self._last_calc_inputs = None
+
             self._update_all_panels_file_info()
             self.main_plot.set_sensor_data(self.sensor_data)
             self.plot_depths()
@@ -722,6 +750,12 @@ class AnalysisController:
                     str(result.trip_datetime), source='trip detector',
                 )
 
+            # Auto-fill trip time on calculate panel
+            if self.calculate_panel is not None and result.trip_datetime is not None:
+                self.calculate_panel.set_trip_time(
+                    str(result.trip_datetime), source='trip detector',
+                )
+
             # Show trip line on the main depth plot
             self.plot_depths()
             self.main_plot.add_trip_line(result.trip_index)
@@ -902,6 +936,23 @@ class AnalysisController:
         mode = (
             self.main_window.get_current_mode() if self.main_window else None
         )
+
+        # Handle Calculate mode: just update the stored index and panel label
+        if mode == 'Calculate':
+            self._calc_start_core_idx = new_idx
+            dt_col = self.sensor_data.datetime_col
+            ts_str = ''
+            if (dt_col in self.sensor_data.df.columns
+                    and 0 <= new_idx < len(self.sensor_data.df)):
+                ts = self.sensor_data.df[dt_col].iloc[new_idx]
+                if pd.notna(ts):
+                    ts_str = str(ts)
+            self.calculate_panel.update_start_core_info(new_idx, ts_str)
+            self.calculate_panel.log_widget.log(
+                f"Start core moved to index {new_idx}"
+            )
+            return
+
         if mode != 'Piston Position':
             return
 
@@ -967,10 +1018,29 @@ class AnalysisController:
                 if pd.notna(ts):
                     self.piston_panel.set_trip_time(str(ts), source='plot drag')
 
-        # If piston has already been calculated, recalculate with new trip gate
+        # Update the trip time widget on the calculate panel
+        if self.calculate_panel is not None:
+            dt_col = self.sensor_data.datetime_col
+            if (dt_col in self.sensor_data.df.columns
+                    and 0 <= new_idx < len(self.sensor_data.df)):
+                ts = self.sensor_data.df[dt_col].iloc[new_idx]
+                if pd.notna(ts):
+                    self.calculate_panel.set_trip_time(
+                        str(ts), source='plot drag',
+                    )
+
         mode = (
             self.main_window.get_current_mode() if self.main_window else None
         )
+
+        # Handle Calculate mode – just log the move
+        if mode == 'Calculate':
+            self.calculate_panel.log_widget.log(
+                f"Trip line moved to index {new_idx}"
+            )
+            return
+
+        # If piston has already been calculated, recalculate with new trip gate
         if mode != 'Piston Position' or self._piston_start_core_idx is None:
             return
 
@@ -1031,6 +1101,474 @@ class AnalysisController:
 
         except Exception as e:
             panel.log_widget.log(f"ERROR updating piston after trip move: {e}")
+
+    # ==================================================================
+    # Calculate Mode
+    # ==================================================================
+
+    def run_calculations(self):
+        """Run coring analysis calculations and display results in the log."""
+        if self.sensor_data is None:
+            self._show_warning("No data loaded")
+            return
+
+        panel = self.calculate_panel
+        ws_col = panel.get_weight_stand_col()
+        rel_col = panel.get_release_col()
+        trig_col = panel.get_trigger_col()  # May be None
+
+        if ws_col is None or rel_col is None:
+            self._show_warning(
+                "Select both Weight Stand and Release Device sensors"
+            )
+            return
+
+        try:
+            # Retrieve depth arrays (interpolated)
+            ws_vals = (
+                self.sensor_data.df[ws_col]
+                .interpolate().ffill().bfill().values
+            )
+            rel_vals = (
+                self.sensor_data.df[rel_col]
+                .interpolate().ffill().bfill().values
+            )
+
+            trig_vals = None
+            if (trig_col is not None
+                    and trig_col in self.sensor_data.df.columns):
+                trig_vals = (
+                    self.sensor_data.df[trig_col]
+                    .interpolate().ffill().bfill().values
+                )
+
+            # Optional Savitzky-Golay smoothing
+            if panel.get_smoothing_enabled():
+                sg_win, sg_poly = panel.get_sg_params()
+                panel.log_widget.log(
+                    f"Applying Savitzky-Golay smoothing "
+                    f"(window={sg_win}, poly={sg_poly})"
+                )
+                ws_vals = apply_savgol(ws_vals, sg_win, sg_poly)
+                rel_vals = apply_savgol(rel_vals, sg_win, sg_poly)
+                if trig_vals is not None:
+                    trig_vals = apply_savgol(trig_vals, sg_win, sg_poly)
+
+            timestamps_epoch = self.sensor_data.get_timestamps_epoch()
+
+            # Resolve trip index from the calculate panel
+            trip_idx = self._resolve_calc_trip_index()
+
+            # Resolve start_core index
+            start_core_idx = self._calc_start_core_idx
+
+            # Piston values (from a previous Piston Position calculation)
+            piston = self._piston_values
+
+            # If smoothing is enabled and piston exists, we should
+            # also smooth piston for consistency
+            if piston is not None and panel.get_smoothing_enabled():
+                sg_win, sg_poly = panel.get_sg_params()
+                piston = apply_savgol(piston, sg_win, sg_poly)
+
+            # Metadata from CSV header
+            md = self.sensor_data.metadata
+            trigger_core_length_ft = md.get('trigger_core_length')
+            core_length_ft = md.get('core_length')
+            trigger_pen = panel.get_trigger_pen()
+
+            panel.log_widget.log("")
+
+            # Log what data is available
+            ws_short = SensorData.get_short_name(ws_col)
+            rel_short = SensorData.get_short_name(rel_col)
+            panel.log_widget.log(f"Weight Stand: {ws_short}")
+            panel.log_widget.log(f"Release Device: {rel_short}")
+            if trig_vals is not None:
+                panel.log_widget.log(
+                    f"Trigger Core/Weight: "
+                    f"{SensorData.get_short_name(trig_col)}"
+                )
+            else:
+                panel.log_widget.log(
+                    "Trigger Core/Weight: not available"
+                )
+
+            if trip_idx is not None:
+                panel.log_widget.log(f"Trip index: {trip_idx}")
+            else:
+                panel.log_widget.log("Trip time: not set")
+
+            if start_core_idx is not None:
+                panel.log_widget.log(
+                    f"Start core index: {start_core_idx}"
+                )
+            else:
+                panel.log_widget.log("Start core: not available")
+
+            if piston is not None:
+                panel.log_widget.log("Piston position: available")
+            else:
+                panel.log_widget.log("Piston position: not computed")
+
+            if trigger_core_length_ft is not None:
+                panel.log_widget.log(
+                    f"Trigger core length: {trigger_core_length_ft} ft"
+                )
+            if core_length_ft is not None:
+                panel.log_widget.log(
+                    f"Core length: {core_length_ft} ft"
+                )
+            if trigger_pen > 0:
+                panel.log_widget.log(
+                    f"Trigger penetration: {trigger_pen} m"
+                )
+
+            # Run calculations
+            results = compute_calculations(
+                weight_stand=ws_vals,
+                release=rel_vals,
+                timestamps_epoch=timestamps_epoch,
+                trip_idx=trip_idx,
+                start_core_idx=start_core_idx,
+                piston=piston,
+                trigger_core=trig_vals,
+                trigger_core_length_ft=trigger_core_length_ft,
+                trigger_pen=trigger_pen,
+                core_length_ft=core_length_ft,
+            )
+
+            # Store results & inputs for export
+            self._last_calc_results = results
+            self._last_calc_inputs = {
+                'weight_stand_col': ws_col,
+                'release_col': rel_col,
+                'trigger_col': trig_col,
+                'smoothing_enabled': panel.get_smoothing_enabled(),
+                'sg_window': panel.get_sg_params()[0] if panel.get_smoothing_enabled() else None,
+                'sg_poly': panel.get_sg_params()[1] if panel.get_smoothing_enabled() else None,
+                'trip_idx': trip_idx,
+                'start_core_idx': start_core_idx,
+                'piston_available': piston is not None,
+                'trigger_core_length_ft': trigger_core_length_ft,
+                'core_length_ft': core_length_ft,
+                'trigger_pen': trigger_pen,
+            }
+
+            panel.log_widget.log(format_results(results))
+
+            # Show smoothed traces on the plot if smoothing is enabled
+            if panel.get_smoothing_enabled():
+                smoothed_data = {}
+                smoothed_data[ws_col] = ws_vals
+                smoothed_data[rel_col] = rel_vals
+                if trig_vals is not None and trig_col is not None:
+                    smoothed_data[trig_col] = trig_vals
+                self.main_plot.add_smoothed_traces(
+                    smoothed_data,
+                    self.sensor_data.depth_columns,
+                )
+            else:
+                self.main_plot.remove_smoothed_traces()
+
+            # Update piston trace on the plot with the (possibly smoothed) values
+            if piston is not None:
+                self.main_plot.update_piston_trace(piston)
+
+        except Exception as e:
+            self._show_error("Calculation Error", str(e))
+            panel.log_widget.log(f"ERROR: {e}")
+
+    def _resolve_calc_trip_index(self) -> Optional[int]:
+        """Determine the trip index for the calculate panel.
+
+        Priority:
+        1. Trip time entered / selected on the calculate panel (epoch).
+        2. Trip detection result stored from the trip-detector mode.
+        3. None (calculations that need trip_idx will be skipped).
+        """
+        if self.sensor_data is None:
+            return None
+
+        panel = self.calculate_panel
+        trip_epoch = panel.get_trip_time_epoch()
+
+        if trip_epoch > 946684800:
+            x = self.sensor_data.get_timestamps_epoch()
+            if len(x) > 0:
+                idx = int(np.searchsorted(x, trip_epoch))
+                return min(idx, len(x) - 1)
+
+        if (hasattr(self, 'trip_detection_result')
+                and self.trip_detection_result is not None):
+            return self.trip_detection_result.trip_index
+
+        return None
+
+    def _sync_trip_to_calculate_panel(self):
+        """Push the best-known trip time into the calculate panel.
+
+        Sources (in priority order):
+        1. Trip detection result (most accurate).
+        2. Piston panel trip time (user may have edited it).
+        3. CSV header metadata (already set during file load).
+        """
+        if self.trip_detection_result is not None:
+            dt = self.trip_detection_result.trip_datetime
+            if dt is not None:
+                self.calculate_panel.set_trip_time(
+                    str(dt), source='trip detector'
+                )
+                return
+        # Fall back to piston panel value
+        if self.piston_panel is not None:
+            epoch = self.piston_panel.get_trip_time_epoch()
+            if epoch > 946684800:
+                qdt = self.piston_panel.trip_time_edit.dateTime()
+                dt_str = qdt.toString('yyyy-MM-dd HH:mm:ss.zzz')
+                self.calculate_panel.set_trip_time(
+                    dt_str, source='piston panel'
+                )
+
+    def _plot_calculate_mode(self):
+        """Plot depth traces with trip and start_core lines for calculate mode."""
+        if self.sensor_data is None:
+            return
+
+        self.plot_depths()
+
+        # Re-add trip line if available
+        trip_idx = self._resolve_calc_trip_index()
+        if trip_idx is not None:
+            self.main_plot.add_trip_line(trip_idx)
+
+        # Re-add start_core line if available
+        if self._calc_start_core_idx is not None:
+            x = self.sensor_data.get_timestamps_epoch()
+            idx = self._calc_start_core_idx
+            if 0 <= idx < len(x):
+                self.main_plot.add_start_core_line(float(x[idx]))
+
+        # Also show piston trace if available
+        if self._piston_values is not None:
+            x = self.sensor_data.get_timestamps_epoch()
+            self.main_plot.add_piston_trace(x, self._piston_values)
+
+    def export_calculation_results(self):
+        """Export the last calculation results, inputs, and corrections to a text file."""
+        if self._last_calc_results is None or self._last_calc_inputs is None:
+            self._show_warning(
+                "No calculation results to export.\n"
+                "Click 'Calculate' first."
+            )
+            return
+
+        core_name = (
+            self.sensor_data.core_title.replace(' ', '_')
+            if self.sensor_data and self.sensor_data.core_title
+            else 'data'
+        )
+        timestamp = pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')
+        default_name = f"{core_name}_calculations_{timestamp}.txt"
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self.main_window, "Export Calculation Results", default_name,
+            "Text Files (*.txt);;All Files (*)"
+        )
+        if not file_path:
+            return
+
+        try:
+            self._write_calculation_export(file_path)
+            self._log_active(f"Results exported to {Path(file_path).name}")
+            QMessageBox.information(
+                self.main_window, "Success",
+                "Calculation results exported successfully!"
+            )
+        except Exception as e:
+            self._show_error("Export Error", str(e))
+
+    def _write_calculation_export(self, file_path: str):
+        """Write calculation results with full context to a text file."""
+        from datetime import datetime
+        from ..domain.processing.calculations import FT_TO_M
+
+        res = self._last_calc_results
+        inp = self._last_calc_inputs
+        sd = self.sensor_data
+        panel = self.calculate_panel
+
+        lines = []
+        lines.append("=" * 60)
+        lines.append("CORING ANALYSIS CALCULATION REPORT")
+        lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("=" * 60)
+
+        # Source data
+        lines.append("")
+        lines.append("--- Source Data ---")
+        if sd is not None:
+            lines.append(f"  File:        {sd.source_file}")
+            lines.append(f"  Core:        {sd.core_title}")
+            lines.append(f"  Rows:        {sd.row_count:,}")
+            lines.append(f"  Sensors:     {sd.num_sensors}")
+            tr = sd.time_range
+            if tr:
+                lines.append(f"  Time range:  {tr[0]} to {tr[1]}")
+
+        # Corrections applied
+        lines.append("")
+        lines.append("--- Corrections Applied ---")
+        if sd is not None and sd.corrections:
+            time_corrections = [
+                c for c in sd.corrections
+                if c.correction_type == 'time_shift'
+            ]
+            depth_corrections = [
+                c for c in sd.corrections
+                if c.correction_type in ('depth_calibration', 'depth_manual')
+            ]
+            if time_corrections:
+                lines.append("  Time corrections:")
+                for corr in time_corrections:
+                    shift = corr.parameters.get('shift_seconds', 0)
+                    sign = '+' if shift >= 0 else ''
+                    short = SensorData.get_short_name(corr.sensor_column)
+                    lines.append(f"    {short}: {sign}{shift:.4f}s")
+            if depth_corrections:
+                lines.append("  Depth corrections:")
+                for corr in depth_corrections:
+                    offset = corr.parameters.get('offset', 0)
+                    sign = '+' if offset >= 0 else ''
+                    short = SensorData.get_short_name(corr.sensor_column)
+                    lines.append(f"    {short}: {sign}{offset:.4f}m")
+        else:
+            lines.append("  None")
+
+        # Inputs / configuration
+        lines.append("")
+        lines.append("--- Calculation Inputs ---")
+        ws_col = inp['weight_stand_col']
+        rel_col = inp['release_col']
+        trig_col = inp['trigger_col']
+        lines.append(
+            f"  Weight Stand:         "
+            f"{SensorData.get_short_name(ws_col)}"
+        )
+        lines.append(
+            f"  Release Device:       "
+            f"{SensorData.get_short_name(rel_col)}"
+        )
+        if trig_col:
+            lines.append(
+                f"  Trigger Core/Weight:  "
+                f"{SensorData.get_short_name(trig_col)}"
+            )
+        else:
+            lines.append("  Trigger Core/Weight:  not available")
+
+        if inp['smoothing_enabled']:
+            lines.append(
+                f"  Savitzky-Golay:       enabled "
+                f"(window={inp['sg_window']}, poly={inp['sg_poly']})"
+            )
+        else:
+            lines.append("  Savitzky-Golay:       disabled")
+
+        if inp['trip_idx'] is not None:
+            lines.append(f"  Trip index:           {inp['trip_idx']}")
+            # Also show the trip datetime
+            if sd is not None:
+                dt_col = sd.datetime_col
+                if (dt_col in sd.df.columns
+                        and 0 <= inp['trip_idx'] < len(sd.df)):
+                    ts = sd.df[dt_col].iloc[inp['trip_idx']]
+                    if pd.notna(ts):
+                        lines.append(f"  Trip time:            {ts}")
+        else:
+            lines.append("  Trip index:           not set")
+
+        if inp['start_core_idx'] is not None:
+            lines.append(
+                f"  Start core index:     {inp['start_core_idx']}"
+            )
+            if sd is not None:
+                dt_col = sd.datetime_col
+                if (dt_col in sd.df.columns
+                        and 0 <= inp['start_core_idx'] < len(sd.df)):
+                    ts = sd.df[dt_col].iloc[inp['start_core_idx']]
+                    if pd.notna(ts):
+                        lines.append(
+                            f"  Start core time:      {ts}"
+                        )
+        else:
+            lines.append("  Start core index:     not available")
+
+        lines.append(
+            f"  Piston position:      "
+            f"{'available' if inp['piston_available'] else 'not computed'}"
+        )
+
+        tc_len = inp['trigger_core_length_ft']
+        if tc_len is not None:
+            lines.append(
+                f"  Trigger core length:  {tc_len} ft "
+                f"({tc_len * FT_TO_M:.3f} m)"
+            )
+        else:
+            lines.append("  Trigger core length:  not available")
+
+        cl = inp['core_length_ft']
+        if cl is not None:
+            lines.append(
+                f"  Core length:          {cl} ft "
+                f"({cl * FT_TO_M:.3f} m)"
+            )
+        else:
+            lines.append("  Core length:          not available")
+
+        lines.append(
+            f"  Trigger penetration:  {inp['trigger_pen']:.2f} m"
+        )
+
+        # Results
+        lines.append("")
+        lines.append("--- Calculated Values ---")
+
+        def _fmt(label: str, val, unit: str = "m") -> str:
+            if val is None:
+                return f"  {label:<30s}  N/A"
+            return f"  {label:<30s}  {val:>10.4f} {unit}"
+
+        lines.append(_fmt("Recoil Max:", res.recoil_max))
+        lines.append(_fmt("Fall Distance:", res.fall_dist))
+        lines.append(_fmt("Suck-in:", res.suck_in))
+        lines.append(_fmt("Recoil at Start Core:", res.recoil_start))
+        lines.append(_fmt("Freefall at Start Core:", res.freefall_start))
+        lines.append(_fmt("Piston Suck:", res.piston_suck))
+
+        if res.seafloor is not None:
+            lines.append(
+                f"  {'Seafloor Depth:':<30s}  {res.seafloor:>10.4f} m"
+            )
+        else:
+            lines.append(f"  {'Seafloor Depth:':<30s}  N/A")
+
+        lines.append(_fmt("Piston Altitude:", res.piston_alt))
+        lines.append(_fmt("Penetration Deficit:", res.pen_deficit))
+        lines.append(_fmt("Freefall Estimate:", res.freefall_est))
+
+        if res.notes:
+            lines.append("")
+            lines.append("--- Notes ---")
+            for note in res.notes:
+                lines.append(f"  {note}")
+
+        lines.append("")
+        lines.append("=" * 60)
+
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
 
     # ==================================================================
     # Common Operations
@@ -1413,9 +1951,35 @@ class AnalysisController:
             self.main_window.hide_secondary_view()
 
         # Clean up piston overlays when leaving Piston Position mode
-        if mode_name != 'Piston Position':
+        if mode_name not in ('Piston Position', 'Calculate'):
             self.main_plot.remove_piston_trace()
             self.main_plot.remove_start_core_line()
+
+        # When entering Calculate mode, restore trip / start_core / piston lines
+        if mode_name == 'Calculate':
+            self.main_plot.remove_piston_trace()
+            self.main_plot.remove_start_core_line()
+            self.main_plot.remove_smoothed_traces()
+            if self.sensor_data is not None:
+                # Sync start_core from piston mode BEFORE plotting
+                # (always refresh – piston mode may have updated it)
+                if self._piston_start_core_idx is not None:
+                    self._calc_start_core_idx = self._piston_start_core_idx
+                    dt_col = self.sensor_data.datetime_col
+                    ts_str = ''
+                    idx = self._calc_start_core_idx
+                    if (dt_col in self.sensor_data.df.columns
+                            and 0 <= idx < len(self.sensor_data.df)):
+                        ts = self.sensor_data.df[dt_col].iloc[idx]
+                        if pd.notna(ts):
+                            ts_str = str(ts)
+                    self.calculate_panel.update_start_core_info(idx, ts_str)
+
+                # Sync trip time from trip detector / piston panel
+                self._sync_trip_to_calculate_panel()
+
+                self._plot_calculate_mode()
+                return  # _plot_calculate_mode already sets sensor data
 
         # Re-plot current data if available
         if self.sensor_data is not None:
@@ -1488,6 +2052,24 @@ class AnalysisController:
             # Pre-fill parameters from metadata
             self.piston_panel.set_parameters_from_metadata(sd.metadata)
 
+        # Update calculate panel
+        if self.calculate_panel is not None:
+            self.calculate_panel.update_file_info(
+                sd.source_file, sd.num_sensors, sd.row_count,
+                sd.core_title,
+            )
+            columns_and_names = [
+                (col, SensorData.get_location_name(col))
+                for col in sd.depth_columns
+            ]
+            ws_col = sd.find_column_by_location('Weight Stand')
+            rel_col = sd.find_column_by_location('Release')
+            trig_col = sd.find_column_by_location('Trigger')
+            self.calculate_panel.populate_sensor_combos(
+                columns_and_names, ws_col, rel_col, trig_col,
+            )
+            self.calculate_panel.set_parameters_from_metadata(sd.metadata)
+
     def _log_active(self, msg: str):
         """Log to the currently active panel."""
         mode = (
@@ -1505,6 +2087,8 @@ class AnalysisController:
             self.trip_panel.log_widget.log(msg)
         elif mode == 'Piston Position':
             self.piston_panel.log_widget.log(msg)
+        elif mode == 'Calculate':
+            self.calculate_panel.log_widget.log(msg)
 
     def _show_error(self, title: str, msg: str):
         if self.main_window:
