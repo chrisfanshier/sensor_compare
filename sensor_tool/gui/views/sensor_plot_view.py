@@ -37,6 +37,8 @@ class SensorPlotView(QWidget):
     selection_cleared = Signal()
     start_core_changed = Signal(int)
     trip_line_changed = Signal(int)
+    end_pen_changed = Signal(int)
+    pullout_changed = Signal(int)
 
     def __init__(self, parent=None, use_datetime_axis: bool = True):
         super().__init__(parent)
@@ -53,6 +55,10 @@ class SensorPlotView(QWidget):
         self._piston_plot_item = None
         self._start_core_line: pg.InfiniteLine | None = None
         self._trip_line: pg.InfiniteLine | None = None
+        self._start_pen_line: pg.InfiniteLine | None = None
+        self._end_pen_line: pg.InfiniteLine | None = None
+        self._pullout_line: pg.InfiniteLine | None = None
+        self._seafloor_line: pg.InfiniteLine | None = None
         self._smoothed_plot_items: list = []
 
         self._setup_ui()
@@ -381,6 +387,141 @@ class SensorPlotView(QWidget):
         else:
             idx = max(0, min(int(round(x_pos)), len(self._sensor_data.df) - 1))
         self.start_core_changed.emit(idx)
+
+    # ------------------------------------------------------------------
+    # Start-penetration line (non-draggable, auto-computed)
+    # ------------------------------------------------------------------
+
+    def add_start_pen_line(self, x_pos: float):
+        """Add a non-draggable start-of-penetration indicator line."""
+        self.remove_start_pen_line()
+        self._start_pen_line = pg.InfiniteLine(
+            pos=x_pos, angle=90, movable=False,
+            pen=pg.mkPen('#17becf', width=2, style=Qt.DashLine),
+            label='Start Pen',
+            labelOpts={'position': 0.85, 'color': '#17becf'},
+        )
+        self.plot_widget.addItem(self._start_pen_line)
+
+    def remove_start_pen_line(self):
+        if self._start_pen_line is not None:
+            try:
+                self.plot_widget.removeItem(self._start_pen_line)
+            except Exception:
+                pass
+            self._start_pen_line = None
+
+    # ------------------------------------------------------------------
+    # Seafloor line (horizontal, non-draggable)
+    # ------------------------------------------------------------------
+
+    def add_seafloor_line(self, depth: float):
+        """Add a horizontal dashed line indicating the seafloor depth."""
+        self.remove_seafloor_line()
+        self._seafloor_line = pg.InfiniteLine(
+            pos=depth, angle=0, movable=False,
+            pen=pg.mkPen('#c0392b', width=1.5, style=Qt.DashLine),
+            label=f'Seafloor {depth:.1f} m',
+            labelOpts={'position': 0.9, 'color': '#c0392b',
+                       'anchors': [(1, 0), (1, 1)]},
+        )
+        self.plot_widget.addItem(self._seafloor_line)
+
+    def remove_seafloor_line(self):
+        if self._seafloor_line is not None:
+            try:
+                self.plot_widget.removeItem(self._seafloor_line)
+            except Exception:
+                pass
+            self._seafloor_line = None
+
+    # ------------------------------------------------------------------
+    # End-of-penetration line
+    # ------------------------------------------------------------------
+
+    def add_end_pen_line(self, x_pos: float):
+        """Add a draggable end-of-initial-penetration line."""
+        self.remove_end_pen_line()
+
+        self._end_pen_line = pg.InfiniteLine(
+            pos=x_pos, angle=90, movable=True,
+            pen=pg.mkPen('#ff7f0e', width=2, style=Qt.DashLine),
+            label='End Pen',
+            labelOpts={'position': 0.8, 'color': '#ff7f0e'},
+        )
+        self._end_pen_line.sigPositionChangeFinished.connect(
+            self._on_end_pen_moved
+        )
+        self.plot_widget.addItem(self._end_pen_line)
+
+    def remove_end_pen_line(self):
+        if self._end_pen_line is not None:
+            try:
+                self._end_pen_line.sigPositionChangeFinished.disconnect(
+                    self._on_end_pen_moved
+                )
+            except Exception:
+                pass
+            try:
+                self.plot_widget.removeItem(self._end_pen_line)
+            except Exception:
+                pass
+            self._end_pen_line = None
+
+    def _on_end_pen_moved(self):
+        if self._end_pen_line is None or self._sensor_data is None:
+            return
+        x_pos = self._end_pen_line.value()
+        if self._use_datetime_axis:
+            timestamps = self._sensor_data.get_timestamps_epoch()
+            idx = int(np.argmin(np.abs(timestamps - x_pos)))
+        else:
+            idx = max(0, min(int(round(x_pos)), len(self._sensor_data.df) - 1))
+        self.end_pen_changed.emit(idx)
+
+    # ------------------------------------------------------------------
+    # Pullout line
+    # ------------------------------------------------------------------
+
+    def add_pullout_line(self, x_pos: float):
+        """Add a draggable pullout line."""
+        self.remove_pullout_line()
+
+        self._pullout_line = pg.InfiniteLine(
+            pos=x_pos, angle=90, movable=True,
+            pen=pg.mkPen('#2ca02c', width=2, style=Qt.DashLine),
+            label='Pullout',
+            labelOpts={'position': 0.7, 'color': '#2ca02c'},
+        )
+        self._pullout_line.sigPositionChangeFinished.connect(
+            self._on_pullout_moved
+        )
+        self.plot_widget.addItem(self._pullout_line)
+
+    def remove_pullout_line(self):
+        if self._pullout_line is not None:
+            try:
+                self._pullout_line.sigPositionChangeFinished.disconnect(
+                    self._on_pullout_moved
+                )
+            except Exception:
+                pass
+            try:
+                self.plot_widget.removeItem(self._pullout_line)
+            except Exception:
+                pass
+            self._pullout_line = None
+
+    def _on_pullout_moved(self):
+        if self._pullout_line is None or self._sensor_data is None:
+            return
+        x_pos = self._pullout_line.value()
+        if self._use_datetime_axis:
+            timestamps = self._sensor_data.get_timestamps_epoch()
+            idx = int(np.argmin(np.abs(timestamps - x_pos)))
+        else:
+            idx = max(0, min(int(round(x_pos)), len(self._sensor_data.df) - 1))
+        self.pullout_changed.emit(idx)
 
     # ------------------------------------------------------------------
     # Selection mode

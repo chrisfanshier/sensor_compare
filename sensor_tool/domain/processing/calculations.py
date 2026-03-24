@@ -117,6 +117,8 @@ def compute_calculations(
     trigger_core_length_ft: Optional[float] = None,
     trigger_pen: float = 0.0,
     core_length_ft: Optional[float] = None,
+    end_pen_idx: Optional[int] = None,
+    pullout_idx: Optional[int] = None,
 ) -> CalculationResults:
     """Compute coring analysis values.
 
@@ -142,6 +144,12 @@ def compute_calculations(
         User-estimated trigger core penetration in metres.
     core_length_ft : float or None
         Core barrel length in feet (from header).
+    end_pen_idx : int or None
+        User-selected index for end of initial penetration.  When
+        ``None``, falls back to trip_idx + 5 seconds.
+    pullout_idx : int or None
+        User-selected index for pullout (WS starts ascending).
+        When ``None``, falls back to global ws_max_idx.
 
     Returns
     -------
@@ -154,25 +162,30 @@ def compute_calculations(
     # Calculations requiring trip_idx
     # -----------------------------------------------------------------
     if trip_idx is not None and 0 <= trip_idx < n:
-        # Index 5 seconds after trip
-        idx_5s = _find_idx_at_time_offset(timestamps_epoch, trip_idx, 5.0)
-        idx_5s = min(idx_5s, n - 1)
+        # End-of-penetration index: user-selected or fallback to trip+5s
+        if end_pen_idx is not None and 0 <= end_pen_idx < n:
+            idx_ep = end_pen_idx
+        else:
+            idx_ep = _find_idx_at_time_offset(
+                timestamps_epoch, trip_idx, 5.0
+            )
+            idx_ep = min(idx_ep, n - 1)
 
-        # recoil_max:  |release[trip] - min(release[trip : trip+5s])|
-        window_end = idx_5s + 1
+        # recoil_max:  |release[trip] - min(release[trip : end_pen])|
+        window_end = idx_ep + 1
         if window_end > trip_idx:
-            min_release_5s = np.nanmin(release[trip_idx:window_end])
-            res.recoil_max = abs(float(release[trip_idx] - min_release_5s))
+            min_release_ep = np.nanmin(release[trip_idx:window_end])
+            res.recoil_max = abs(float(release[trip_idx] - min_release_ep))
             res.notes.append(
-                f"recoil_max window: idx {trip_idx}..{idx_5s}"
+                f"recoil_max window: idx {trip_idx}..{idx_ep}"
             )
 
-        # fall_dist: |weight_stand[trip] - weight_stand[trip+5s]|
-        res.fall_dist = abs(float(weight_stand[trip_idx] - weight_stand[idx_5s]))
+        # fall_dist: |weight_stand[trip] - weight_stand[end_pen]|
+        res.fall_dist = abs(float(weight_stand[trip_idx] - weight_stand[idx_ep]))
 
-        # suck_in: |weight_stand[trip+5s] - max(weight_stand)|
+        # suck_in: |weight_stand[end_pen] - max(weight_stand)|
         ws_max = np.nanmax(weight_stand)
-        res.suck_in = abs(float(weight_stand[idx_5s] - ws_max))
+        res.suck_in = abs(float(weight_stand[idx_ep] - ws_max))
 
         # -----------------------------------------------------------------
         # Calculations requiring trip_idx AND start_core_idx
@@ -195,19 +208,26 @@ def compute_calculations(
                 and start_core_idx is not None
                 and 0 <= start_core_idx < n):
             try:
-                # Point A: where weight_stand starts decreasing after
-                #          reaching its maximum depth.
-                ws_max_idx = int(np.nanargmax(weight_stand))
+                # Point A (pullout): user-selected or fallback to
+                # ws_max across the whole record.
+                if (pullout_idx is not None
+                        and 0 <= pullout_idx < n):
+                    ws_max_idx = pullout_idx
+                else:
+                    ws_max_idx = int(np.nanargmax(weight_stand))
 
-                # Point B: first index after start_core where release
-                #          crosses the depth it was at at trip_time.
+                # Point B: first index >= end_pen where release
+                #          returns to the depth it was at trip_time.
+                #          Search capped at 10 minutes after trip.
                 release_at_trip = release[trip_idx]
-                search_start = start_core_idx
-                # Looking for index where release returns to trip-time depth
-                # (i.e. crosses from deeper back toward shallower, or vice-versa)
-                diffs = np.abs(release[search_start:] - release_at_trip)
+                search_start = idx_ep
+                search_end = _find_idx_at_time_offset(
+                    timestamps_epoch, trip_idx, 600.0
+                )
+                search_end = min(search_end, n - 1)
+                diffs = np.abs(release[search_start:search_end] - release_at_trip)
                 crossing_candidates = np.where(
-                    diffs <= np.nanmin(diffs) * 1.0 + 0.05  # small tolerance
+                    diffs <= np.nanmin(diffs) + 0.05
                 )[0]
                 if len(crossing_candidates) > 0:
                     cross_idx = search_start + int(crossing_candidates[0])

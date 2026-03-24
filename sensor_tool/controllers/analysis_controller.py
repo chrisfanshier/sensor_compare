@@ -33,6 +33,7 @@ from ..domain.processing.piston_position import (
 from ..domain.processing.calculations import (
     compute_calculations, format_results, apply_savgol,
 )
+from ..gui.views.calculation_plot_view import GeometryInput, WEIGHT_LENGTH
 from ..persistence.csv_loader import CSVLoader
 from ..persistence.calibration_io import CalibrationIO
 
@@ -69,6 +70,7 @@ class AnalysisController:
         self.heave_plot = None
         self.statistics_table = None
         self.trip_plot = None
+        self.calculation_plot = None
 
         # Panels
         self.view_panel = None
@@ -81,6 +83,8 @@ class AnalysisController:
 
         # Calculate mode state
         self._calc_start_core_idx: Optional[int] = None
+        self._end_pen_idx: Optional[int] = None
+        self._pullout_idx: Optional[int] = None
         self._last_calc_results = None
         self._last_calc_inputs: Optional[dict] = None
 
@@ -150,6 +154,12 @@ class AnalysisController:
         # Main plot trip line drag signal
         self.main_plot.trip_line_changed.connect(self._on_trip_line_moved)
 
+        # Main plot end-of-penetration line drag signal
+        self.main_plot.end_pen_changed.connect(self._on_end_pen_moved)
+
+        # Main plot pullout line drag signal
+        self.main_plot.pullout_changed.connect(self._on_pullout_moved)
+
         # Piston export
         self.piston_panel.export_piston_requested.connect(self.export_piston_csv)
 
@@ -161,6 +171,10 @@ class AnalysisController:
         )
         self.calculate_panel.export_results_requested.connect(
             self.export_calculation_results
+        )
+        self.calculate_panel.reset_lines_requested.connect(self._reset_lines)
+        self.calculate_panel.export_diagram_requested.connect(
+            self.export_calculation_diagram
         )
 
     # ==================================================================
@@ -182,6 +196,8 @@ class AnalysisController:
             self._piston_start_core_idx = None
             self._piston_values = None
             self._calc_start_core_idx = None
+            self._end_pen_idx = None
+            self._pullout_idx = None
             self._last_calc_results = None
             self._last_calc_inputs = None
 
@@ -1102,6 +1118,56 @@ class AnalysisController:
         except Exception as e:
             panel.log_widget.log(f"ERROR updating piston after trip move: {e}")
 
+    def _on_end_pen_moved(self, new_idx: int):
+        """Handle the user dragging the end-of-penetration line."""
+        if self.sensor_data is None:
+            return
+
+        self._end_pen_idx = new_idx
+
+        # Update the panel label
+        dt_col = self.sensor_data.datetime_col
+        ts_str = ''
+        if (dt_col in self.sensor_data.df.columns
+                and 0 <= new_idx < len(self.sensor_data.df)):
+            ts = self.sensor_data.df[dt_col].iloc[new_idx]
+            if pd.notna(ts):
+                ts_str = str(ts)
+        self.calculate_panel.update_end_pen_info(new_idx, ts_str)
+        self.calculate_panel.log_widget.log(
+            f"End-of-penetration line moved to index {new_idx}"
+        )
+
+    def _on_pullout_moved(self, new_idx: int):
+        """Handle the user dragging the pullout line."""
+        if self.sensor_data is None:
+            return
+
+        self._pullout_idx = new_idx
+
+        dt_col = self.sensor_data.datetime_col
+        ts_str = ''
+        if (dt_col in self.sensor_data.df.columns
+                and 0 <= new_idx < len(self.sensor_data.df)):
+            ts = self.sensor_data.df[dt_col].iloc[new_idx]
+            if pd.notna(ts):
+                ts_str = str(ts)
+        self.calculate_panel.update_pullout_info(new_idx, ts_str)
+        self.calculate_panel.log_widget.log(
+            f"Pullout line moved to index {new_idx}"
+        )
+
+    def _reset_lines(self):
+        """Reset end-of-penetration and pullout lines to auto-calculated positions."""
+        self._end_pen_idx = None
+        self._pullout_idx = None
+        self.calculate_panel.end_pen_label.setText("Not set")
+        self.calculate_panel.pullout_label.setText("Not set")
+        self._plot_calculate_mode()
+        self.calculate_panel.log_widget.log(
+            "End-of-penetration and pullout lines reset to auto"
+        )
+
     # ==================================================================
     # Calculate Mode
     # ==================================================================
@@ -1224,6 +1290,26 @@ class AnalysisController:
                     f"Trigger penetration: {trigger_pen} m"
                 )
 
+            end_pen_idx = self._end_pen_idx
+            if end_pen_idx is not None:
+                panel.log_widget.log(
+                    f"End of initial penetration index: {end_pen_idx}"
+                )
+            else:
+                panel.log_widget.log(
+                    "End of initial penetration: not set (using trip+5s)"
+                )
+
+            pullout_idx = self._pullout_idx
+            if pullout_idx is not None:
+                panel.log_widget.log(
+                    f"Pullout index: {pullout_idx}"
+                )
+            else:
+                panel.log_widget.log(
+                    "Pullout: not set (using ws_max)"
+                )
+
             # Run calculations
             results = compute_calculations(
                 weight_stand=ws_vals,
@@ -1236,6 +1322,8 @@ class AnalysisController:
                 trigger_core_length_ft=trigger_core_length_ft,
                 trigger_pen=trigger_pen,
                 core_length_ft=core_length_ft,
+                end_pen_idx=end_pen_idx,
+                pullout_idx=pullout_idx,
             )
 
             # Store results & inputs for export
@@ -1275,9 +1363,103 @@ class AnalysisController:
             if piston is not None:
                 self.main_plot.update_piston_trace(piston)
 
+            # Update the geometry diagram in the secondary view
+            self._update_calculation_plot(
+                results, ws_vals, piston, trip_idx,
+                start_core_idx, core_length_ft,
+                end_pen_idx, pullout_idx,
+            )
+
+            # Refresh start_pen line on upper plot with current seafloor
+            self._update_start_pen_line(trip_idx)
+
         except Exception as e:
             self._show_error("Calculation Error", str(e))
             panel.log_widget.log(f"ERROR: {e}")
+
+    def _update_calculation_plot(
+        self,
+        results,
+        ws_vals: np.ndarray,
+        piston: Optional[np.ndarray],
+        trip_idx: Optional[int],
+        start_core_idx: Optional[int],
+        core_length_ft: Optional[float],
+        end_pen_idx: Optional[int] = None,
+        pullout_idx: Optional[int] = None,
+    ):
+        """Build a GeometryInput and update the secondary diagram."""
+        if self.calculation_plot is None:
+            return
+        if trip_idx is None or results.seafloor is None:
+            self.calculation_plot.clear()
+            return
+        if core_length_ft is None or core_length_ft <= 0:
+            self.calculation_plot.clear()
+            return
+
+        FT_TO_M = 1.0 / 3.28
+        core_length_m = core_length_ft * FT_TO_M
+        n = len(ws_vals)
+        freefall_est = results.freefall_est if results.freefall_est is not None else 0.0
+
+        # -- Start Core values --
+        ws_at_sc = None
+        piston_at_sc = None
+        piston_alt_sc = None
+        if start_core_idx is not None and 0 <= start_core_idx < n:
+            ws_at_sc = float(ws_vals[start_core_idx])
+            if piston is not None and start_core_idx < len(piston):
+                piston_at_sc = float(piston[start_core_idx])
+                piston_alt_sc = results.piston_alt  # seafloor - piston[start_core]
+
+        # -- Start Penetration values --
+        # start_pen = first index >= start_core where core_tip >= seafloor
+        ws_at_sp = None
+        piston_at_sp = None
+        piston_alt_sp = None
+        core_tip_series = ws_vals + WEIGHT_LENGTH + core_length_m
+        search_from = start_core_idx if (start_core_idx is not None
+                                         and 0 <= start_core_idx < n) else trip_idx
+        after_search = core_tip_series[search_from:]
+        pen_candidates = np.where(after_search >= results.seafloor)[0]
+        if len(pen_candidates) > 0:
+            sp_idx = search_from + int(pen_candidates[0])
+            if 0 <= sp_idx < n:
+                ws_at_sp = float(ws_vals[sp_idx])
+                if piston is not None and sp_idx < len(piston):
+                    piston_at_sp = float(piston[sp_idx])
+                    piston_alt_sp = results.seafloor - piston_at_sp
+
+        # -- End-of-penetration values --
+        ws_at_ep = None
+        if end_pen_idx is not None and 0 <= end_pen_idx < n:
+            ws_at_ep = float(ws_vals[end_pen_idx])
+
+        # -- Pullout values --
+        ws_at_po = None
+        piston_at_po = None
+        if pullout_idx is not None and 0 <= pullout_idx < n:
+            ws_at_po = float(ws_vals[pullout_idx])
+            if piston is not None and pullout_idx < len(piston):
+                piston_at_po = float(piston[pullout_idx])
+
+        geo = GeometryInput(
+            ws_at_trip=float(ws_vals[trip_idx]),
+            seafloor=results.seafloor,
+            core_length_m=core_length_m,
+            freefall_est=freefall_est,
+            ws_at_start_core=ws_at_sc,
+            piston_at_start_core=piston_at_sc,
+            piston_alt_at_start_core=piston_alt_sc,
+            ws_at_start_pen=ws_at_sp,
+            piston_at_start_pen=piston_at_sp,
+            piston_alt_at_start_pen=piston_alt_sp,
+            ws_at_end_pen=ws_at_ep,
+            ws_at_pullout=ws_at_po,
+            piston_at_pullout=piston_at_po,
+        )
+        self.calculation_plot.plot_geometry(geo)
 
     def _resolve_calc_trip_index(self) -> Optional[int]:
         """Determine the trip index for the calculate panel.
@@ -1349,10 +1531,115 @@ class AnalysisController:
             if 0 <= idx < len(x):
                 self.main_plot.add_start_core_line(float(x[idx]))
 
+        # Add start_pen line (non-draggable, auto-computed)
+        self._update_start_pen_line(trip_idx)
+
+        # Add end-of-penetration line
+        x = self.sensor_data.get_timestamps_epoch()
+        if self._end_pen_idx is not None and 0 <= self._end_pen_idx < len(x):
+            self.main_plot.add_end_pen_line(float(x[self._end_pen_idx]))
+        elif trip_idx is not None:
+            # Auto-initialize to trip + 5s
+            target = x[trip_idx] + 5.0
+            ep_idx = int(np.argmin(np.abs(x - target)))
+            self._end_pen_idx = ep_idx
+            self.main_plot.add_end_pen_line(float(x[ep_idx]))
+            # Update panel label
+            dt_col = self.sensor_data.datetime_col
+            ts_str = ''
+            if (dt_col in self.sensor_data.df.columns
+                    and 0 <= ep_idx < len(self.sensor_data.df)):
+                ts = self.sensor_data.df[dt_col].iloc[ep_idx]
+                if pd.notna(ts):
+                    ts_str = str(ts)
+            self.calculate_panel.update_end_pen_info(ep_idx, ts_str)
+
+        # Add pullout line
+        if self._pullout_idx is not None and 0 <= self._pullout_idx < len(x):
+            self.main_plot.add_pullout_line(float(x[self._pullout_idx]))
+        elif self._end_pen_idx is not None:
+            # Auto-initialize to ws_max after end_pen
+            ep = self._end_pen_idx
+            panel = self.calculate_panel
+            ws_col = panel.get_weight_stand_col()
+            if ws_col is not None and ws_col in self.sensor_data.df.columns:
+                ws_vals = (
+                    self.sensor_data.df[ws_col]
+                    .interpolate().ffill().bfill().values
+                )
+                # Look for max WS in a 10-min window after end_pen
+                window_10min = int(np.argmin(np.abs(x - (x[ep] + 600.0))))
+                window_10min = min(window_10min, len(ws_vals) - 1)
+                search_slice = ws_vals[ep:window_10min + 1]
+                if len(search_slice) > 0:
+                    po_idx = ep + int(np.nanargmax(search_slice))
+                else:
+                    po_idx = ep
+                self._pullout_idx = po_idx
+                self.main_plot.add_pullout_line(float(x[po_idx]))
+                dt_col = self.sensor_data.datetime_col
+                ts_str = ''
+                if (dt_col in self.sensor_data.df.columns
+                        and 0 <= po_idx < len(self.sensor_data.df)):
+                    ts = self.sensor_data.df[dt_col].iloc[po_idx]
+                    if pd.notna(ts):
+                        ts_str = str(ts)
+                self.calculate_panel.update_pullout_info(po_idx, ts_str)
+
         # Also show piston trace if available
         if self._piston_values is not None:
             x = self.sensor_data.get_timestamps_epoch()
             self.main_plot.add_piston_trace(x, self._piston_values)
+
+    def _update_start_pen_line(self, trip_idx: Optional[int] = None):
+        """Recompute and display the start-penetration and seafloor lines."""
+        self.main_plot.remove_start_pen_line()
+        self.main_plot.remove_seafloor_line()
+        if self.sensor_data is None or trip_idx is None:
+            return
+        x = self.sensor_data.get_timestamps_epoch()
+        md = self.sensor_data.metadata
+        core_length_ft = md.get('core_length')
+        if not core_length_ft or core_length_ft <= 0:
+            return
+        FT_TO_M_local = 1.0 / 3.28
+        core_length_m = core_length_ft * FT_TO_M_local
+        panel = self.calculate_panel
+        ws_col = panel.get_weight_stand_col()
+        trig_col = panel.get_trigger_col()
+        if not ws_col or ws_col not in self.sensor_data.df.columns:
+            return
+        ws_vals = (
+            self.sensor_data.df[ws_col]
+            .interpolate().ffill().bfill().values
+        )
+        sf = None
+        if trig_col and trig_col in self.sensor_data.df.columns:
+            trig_vals = (
+                self.sensor_data.df[trig_col]
+                .interpolate().ffill().bfill().values
+            )
+            tc_len_ft = md.get('trigger_core_length')
+            trigger_pen = panel.get_trigger_pen()
+            if tc_len_ft and tc_len_ft > 0:
+                sf = (float(trig_vals[trip_idx])
+                      + tc_len_ft * FT_TO_M_local
+                      - trigger_pen)
+        if sf is None:
+            return
+        # Add seafloor line
+        self.main_plot.add_seafloor_line(sf)
+        # Add start_pen line
+        core_tip = ws_vals + WEIGHT_LENGTH + core_length_m
+        search_from = (self._calc_start_core_idx
+                       if self._calc_start_core_idx is not None
+                       else trip_idx)
+        after = core_tip[search_from:]
+        candidates = np.where(after >= sf)[0]
+        if len(candidates) > 0:
+            sp_idx = search_from + int(candidates[0])
+            if 0 <= sp_idx < len(x):
+                self.main_plot.add_start_pen_line(float(x[sp_idx]))
 
     def export_calculation_results(self):
         """Export the last calculation results, inputs, and corrections to a text file."""
@@ -1384,6 +1671,45 @@ class AnalysisController:
             QMessageBox.information(
                 self.main_window, "Success",
                 "Calculation results exported successfully!"
+            )
+        except Exception as e:
+            self._show_error("Export Error", str(e))
+
+    def export_calculation_diagram(self):
+        """Export the geometry diagram to an image file."""
+        if self.calculation_plot is None:
+            self._show_warning("No diagram to export.")
+            return
+
+        import pyqtgraph.exporters as exporters
+
+        core_name = (
+            self.sensor_data.core_title.replace(' ', '_')
+            if self.sensor_data and self.sensor_data.core_title
+            else 'diagram'
+        )
+        timestamp = pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')
+        default_name = f"{core_name}_geometry_{timestamp}.png"
+
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self.main_window, "Export Geometry Diagram", default_name,
+            "PNG Image (*.png);;SVG Image (*.svg);;All Files (*)"
+        )
+        if not file_path:
+            return
+
+        try:
+            plot_item = self.calculation_plot.plot_widget.plotItem
+            if file_path.lower().endswith('.svg'):
+                exporter = exporters.SVGExporter(plot_item)
+            else:
+                exporter = exporters.ImageExporter(plot_item)
+                exporter.parameters()['width'] = 1600
+            exporter.export(file_path)
+            self._log_active(f"Diagram exported to {Path(file_path).name}")
+            QMessageBox.information(
+                self.main_window, "Success",
+                "Geometry diagram exported successfully!"
             )
         except Exception as e:
             self._show_error("Export Error", str(e))
@@ -1947,6 +2273,8 @@ class AnalysisController:
             self.main_window.show_secondary_view('statistics')
         elif mode_name == 'Trip Detector':
             self.main_window.show_secondary_view('trip')
+        elif mode_name == 'Calculate':
+            self.main_window.show_secondary_view('calculation')
         else:
             self.main_window.hide_secondary_view()
 
@@ -1954,6 +2282,8 @@ class AnalysisController:
         if mode_name not in ('Piston Position', 'Calculate'):
             self.main_plot.remove_piston_trace()
             self.main_plot.remove_start_core_line()
+            self.main_plot.remove_end_pen_line()
+            self.main_plot.remove_pullout_line()
 
         # When entering Calculate mode, restore trip / start_core / piston lines
         if mode_name == 'Calculate':

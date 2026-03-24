@@ -41,6 +41,8 @@ class CalculatePanel(BaseModePanel):
     calculate_requested = Signal()
     plot_original_requested = Signal()
     export_results_requested = Signal()
+    export_diagram_requested = Signal()
+    reset_lines_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -114,6 +116,53 @@ class CalculatePanel(BaseModePanel):
         sc_group.setLayout(sc_layout)
         self._layout.addWidget(sc_group)
 
+        # -- End of Initial Penetration --------------------------------------
+        ep_group = QGroupBox("End of Initial Penetration")
+        ep_layout = QVBoxLayout()
+
+        self.end_pen_label = QLabel("Not set")
+        self.end_pen_label.setWordWrap(True)
+        ep_layout.addWidget(self.end_pen_label)
+
+        ep_note = QLabel(
+            "Drag the orange dashed line on the plot to set.\n"
+            "Used for fall_dist, suck_in, and piston_suck."
+        )
+        ep_note.setStyleSheet("QLabel { color: gray; font-style: italic; }")
+        ep_note.setWordWrap(True)
+        ep_layout.addWidget(ep_note)
+
+        ep_group.setLayout(ep_layout)
+        self._layout.addWidget(ep_group)
+
+        # -- Pullout ---------------------------------------------------------
+        po_group = QGroupBox("Pullout")
+        po_layout = QVBoxLayout()
+
+        self.pullout_label = QLabel("Not set")
+        self.pullout_label.setWordWrap(True)
+        po_layout.addWidget(self.pullout_label)
+
+        po_note = QLabel(
+            "Drag the green dashed line on the plot to set.\n"
+            "WS depth at this point is used for piston_suck."
+        )
+        po_note.setStyleSheet("QLabel { color: gray; font-style: italic; }")
+        po_note.setWordWrap(True)
+        po_layout.addWidget(po_note)
+
+        po_group.setLayout(po_layout)
+        self._layout.addWidget(po_group)
+
+        # -- Reset Lines button ----------------------------------------------
+        reset_lines_btn = QPushButton("Reset Lines to Auto")
+        reset_lines_btn.setToolTip(
+            "Reset End-of-Penetration and Pullout lines\n"
+            "back to their auto-calculated positions."
+        )
+        reset_lines_btn.clicked.connect(self.reset_lines_requested.emit)
+        self._layout.addWidget(reset_lines_btn)
+
         # -- Smoothing -------------------------------------------------------
         smooth_group = QGroupBox("Savitzky-Golay Smoothing")
         smooth_layout = QGridLayout()
@@ -181,6 +230,10 @@ class CalculatePanel(BaseModePanel):
         export_btn = QPushButton("Export Results")
         export_btn.clicked.connect(self.export_results_requested.emit)
         action_layout.addWidget(export_btn)
+
+        export_diag_btn = QPushButton("Export Diagram")
+        export_diag_btn.clicked.connect(self.export_diagram_requested.emit)
+        action_layout.addWidget(export_diag_btn)
 
         action_group.setLayout(action_layout)
         self._layout.addWidget(action_group)
@@ -302,6 +355,20 @@ class CalculatePanel(BaseModePanel):
         if timestamp_str:
             text += f"\nTime: {timestamp_str}"
         self.start_core_label.setText(text)
+
+    def update_end_pen_info(self, index: int, timestamp_str: str = ''):
+        """Update the end-of-penetration info label."""
+        text = f"Index: {index}"
+        if timestamp_str:
+            text += f"\nTime: {timestamp_str}"
+        self.end_pen_label.setText(text)
+
+    def update_pullout_info(self, index: int, timestamp_str: str = ''):
+        """Update the pullout info label."""
+        text = f"Index: {index}"
+        if timestamp_str:
+            text += f"\nTime: {timestamp_str}"
+        self.pullout_label.setText(text)
 
     def get_weight_stand_col(self) -> str | None:
         return self.weight_stand_combo.currentData()

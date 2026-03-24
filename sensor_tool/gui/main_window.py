@@ -30,6 +30,7 @@ from ..gui.views.sensor_plot_view import SensorPlotView
 from ..gui.views.velocity_plot_view import HeavePlotView
 from ..gui.views.statistics_table import StatisticsTableView
 from ..gui.views.trip_plot_view import TripPlotView
+from ..gui.views.calculation_plot_view import CalculationPlotView
 from ..gui.panels.view_data_panel import ViewDataPanel
 from ..gui.panels.depth_offset_panel import DepthOffsetPanel
 from ..gui.panels.time_offset_panel import TimeOffsetPanel
@@ -125,11 +126,13 @@ class MainWindow(QMainWindow):
         self.heave_plot = HeavePlotView()
         self.statistics_table = StatisticsTableView()
         self.trip_plot = TripPlotView()
+        self.calculation_plot = CalculationPlotView()
 
         self.secondary_stack = QStackedWidget()
         self.secondary_stack.addWidget(self.heave_plot)       # 0
         self.secondary_stack.addWidget(self.statistics_table) # 1
         self.secondary_stack.addWidget(self.trip_plot)        # 2
+        self.secondary_stack.addWidget(self.calculation_plot) # 3
         self.secondary_stack.setVisible(False)
 
         # -- Right splitter (main plot + secondary) --
@@ -153,6 +156,7 @@ class MainWindow(QMainWindow):
         self.controller.heave_plot = self.heave_plot
         self.controller.statistics_table = self.statistics_table
         self.controller.trip_plot = self.trip_plot
+        self.controller.calculation_plot = self.calculation_plot
         self.controller.view_panel = self.view_panel
         self.controller.depth_panel = self.depth_panel
         self.controller.time_panel = self.time_panel
@@ -185,6 +189,8 @@ class MainWindow(QMainWindow):
             self.secondary_stack.setCurrentIndex(1)
         elif view_type == 'trip':
             self.secondary_stack.setCurrentIndex(2)
+        elif view_type == 'calculation':
+            self.secondary_stack.setCurrentIndex(3)
         self.secondary_stack.setVisible(True)
 
     def hide_secondary_view(self):
